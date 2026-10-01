@@ -1,0 +1,13 @@
+{
+  "name": "quality-loop",
+  "label": "Quality Loop",
+  "description": "Code examination, prompt execution, validation, repair, and repeat campaigns",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/quality-loop",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
