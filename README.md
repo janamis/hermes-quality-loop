@@ -33,7 +33,7 @@ hermes plugins install quality-loop
 For a direct installation from this repository, pin the exact commit you reviewed:
 
 ```bash
-hermes plugins install https://github.com/janamis/hermes-quality-loop --sha FULL_40_CHARACTER_SHA
+hermes plugins install https://github.com/janamis/hermes-quality-loop --ref FULL_40_CHARACTER_SHA
 ```
 
 Then enable `quality-loop` for the profile you use with Hermes Desktop.
