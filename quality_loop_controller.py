@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -111,6 +113,54 @@ def _conn() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE campaigns ADD COLUMN {name} {declaration}")
     conn.commit()
     return conn
+
+
+@contextmanager
+def _campaign_process_lock(campaign_id: str) -> Iterator[bool]:
+    """Try to own one campaign across profile gateway processes.
+
+    Reconciliation is intentionally non-blocking: another process already running a long hard
+    gate or publication step makes this caller leave the campaign for a later tick.
+    """
+    lock_dir = get_default_hermes_root() / "plugin-data" / PLUGIN_ID / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    handle = (lock_dir / f"{campaign_id}.lock").open("a+b")
+    acquired = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except OSError:
+                acquired = False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def _row_dict(row: sqlite3.Row | None) -> Optional[dict[str, Any]]:
@@ -347,8 +397,9 @@ The final board action MUST be kanban_complete or kanban_block.
 For kanban_complete, its metadata argument is mandatory: pass the exact quality_loop object
 requested below in metadata as well as writing a concise human-readable summary. Never omit it.
 If the tool model cannot populate nested metadata and would send metadata={{}}, put the same complete
-outer JSON object on one summary line prefixed exactly `QUALITY_LOOP_JSON: `; Hermes will parse and
-persist it as metadata before closing the card. Do not repeat a failing empty-metadata call.
+outer JSON object on one summary line prefixed exactly `QUALITY_LOOP_JSON: `; the Quality Loop
+controller will parse that line while reconciling the completed card.
+Do not repeat a failing empty-metadata call.
 """
     if stage == "examine":
         target = c.get("target_average")
@@ -544,6 +595,16 @@ If this selected item is not complete, return FAIL with a correction_prompt. Do 
 """
 
 
+def _repair_body(correction: str) -> str:
+    return f"""
+REPAIR SCOPE FROM FAILED VALIDATION:
+{correction[:8000]}
+
+Implement this correction only, rerun focused verification, and preserve the original selected
+item's scope. The controller will create a fresh independent validation card after this repair.
+"""
+
+
 def _selected_campaign_improvement(c: dict[str, Any]) -> Optional[dict[str, Any]]:
     proposal_task_id = c.get("proposal_task_id")
     if not proposal_task_id:
@@ -562,6 +623,7 @@ def _create_task(
     stage: str,
     parents: list[str],
     improvement: Optional[dict[str, Any]] = None,
+    correction: str = "",
 ) -> str:
     model_key = {
         "examine": "examiner_model",
@@ -585,6 +647,7 @@ def _create_task(
             body=(
                 _task_body(c, stage)
                 + (_execute_item_body(c, improvement) if stage == "execute" and improvement else "")
+                + (_repair_body(correction) if stage == "execute" and correction else "")
                 + (_validation_item_body(improvement) if stage == "validate" and improvement else "")
             ),
             assignee=c["assignee"],
@@ -745,6 +808,16 @@ def _handoff(run: Any, *, expected_role: str | None = None) -> Optional[dict[str
         if meta.get("schema") == SCHEMA and isinstance(meta.get("role"), str):
             return meta
     text = (run.summary or "").strip()
+    for line in text.splitlines():
+        if not line.startswith("QUALITY_LOOP_JSON: "):
+            continue
+        try:
+            parsed = json.loads(line.removeprefix("QUALITY_LOOP_JSON: ").strip())
+            candidate = parsed.get("quality_loop", parsed) if isinstance(parsed, dict) else None
+            if isinstance(candidate, dict):
+                return candidate
+        except (TypeError, json.JSONDecodeError):
+            pass
     if text.startswith("{"):
         try:
             parsed = json.loads(text)
@@ -777,16 +850,16 @@ def _worker_comment_handoff(
     ended_at = int(getattr(run, "ended_at", 0) or int(time.time()))
     conn = kbc.connect(board=board)
     try:
-        rows = conn.execute(
-            "SELECT body FROM task_comments "
-            "WHERE task_id = ? AND author = ? AND created_at >= ? AND created_at <= ? "
-            "ORDER BY created_at DESC, id DESC",
-            (task_id, expected_author, started_at, ended_at + 5),
-        ).fetchall()
+        comments = kb.list_comments(conn, task_id)
     finally:
         conn.close()
-    for row in rows:
-        payload = _summary_fallback_handoff(str(row["body"] or ""), expected_role)
+    eligible = (
+        comment
+        for comment in reversed(comments)
+        if comment.author == expected_author and started_at <= comment.created_at <= ended_at + 5
+    )
+    for comment in eligible:
+        payload = _summary_fallback_handoff(str(comment.body or ""), expected_role)
         if payload:
             payload["recovered_from_comment"] = True
             return payload
@@ -980,7 +1053,7 @@ def _pause(c: dict[str, Any], message: str, state: str = "needs_review", run_id:
     _update(c["id"], **fields)
 
 
-def reconcile_campaign(campaign_id: str) -> Optional[dict[str, Any]]:
+def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]:
     with _LOCK:
         c = get_campaign(campaign_id)
         if not c or c["state"] != "running":
@@ -1212,7 +1285,7 @@ def reconcile_campaign(campaign_id: str) -> Optional[dict[str, Any]]:
                         correction = "Correct all validator findings: " + "; ".join(map(str, findings))
                     # The failed validator handoff is the repair executor's parent context.
                     c["repair_no"] = next_repair
-                    task_id = _create_task(c, "execute", [task.id])
+                    task_id = _create_task(c, "execute", [task.id], correction=correction)
                     _update(
                         campaign_id, stage="execute", active_task_id=task_id,
                         repair_no=next_repair, processed_run_id=run.id if run else None,
@@ -1220,6 +1293,13 @@ def reconcile_campaign(campaign_id: str) -> Optional[dict[str, Any]]:
                     )
 
         return get_campaign(campaign_id)
+
+
+def reconcile_campaign(campaign_id: str) -> Optional[dict[str, Any]]:
+    with _campaign_process_lock(campaign_id) as acquired:
+        if not acquired:
+            return get_campaign(campaign_id)
+        return _reconcile_campaign_in_process(campaign_id)
 
 
 def reconcile_all(board: str | None = None) -> None:

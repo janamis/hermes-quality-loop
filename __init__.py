@@ -4,11 +4,57 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 from typing import Any
 
 from . import quality_loop_controller as controller
 
 logger = logging.getLogger(__name__)
+
+
+class _ReconcileWorker:
+    """Serialize slow campaign reconciliation away from dispatcher ticks."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._pending: set[str | None] = set()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="quality-loop-reconcile",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, board: str | None) -> None:
+        with self._lock:
+            if board in self._pending:
+                return
+            self._pending.add(board)
+        self._queue.put(board)
+
+    def _run(self) -> None:
+        while True:
+            board = self._queue.get()
+            try:
+                controller.reconcile_all(board=board)
+            except Exception:
+                logger.exception("quality-loop background reconcile failed for board %s", board)
+            finally:
+                with self._lock:
+                    self._pending.discard(board)
+                self._queue.task_done()
+
+
+_WORKER: _ReconcileWorker | None = None
+
+
+def _worker() -> _ReconcileWorker:
+    global _WORKER
+    if _WORKER is None:
+        _WORKER = _ReconcileWorker()
+    return _WORKER
 
 
 def _status_text() -> str:
@@ -25,10 +71,12 @@ def _status_text() -> str:
 
 
 def register(ctx: Any) -> None:
+    worker = _worker()
+
     def on_tick(board: str | None = None, dry_run: bool = False, **_: Any) -> None:
         if dry_run:
             return
-        controller.reconcile_all(board=board)
+        worker.submit(board)
 
     def slash(raw: str) -> str:
         arg = raw.strip().lower()

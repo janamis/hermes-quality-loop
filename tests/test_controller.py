@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -553,6 +554,12 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertEqual(payload["verdict"], "proposal")
         self.assertTrue(payload["recovered_from_summary"])
 
+    def test_quality_loop_json_prefix_is_parsed_from_summary(self):
+        payload = self.proposal()
+        summary = "Worker summary\nQUALITY_LOOP_JSON: " + json.dumps({"quality_loop": payload})
+        run = SimpleNamespace(metadata={}, summary=summary)
+        self.assertEqual(controller._handoff(run, expected_role="examine"), payload)
+
     def test_task_body_requires_metadata_argument(self):
         c = self.create_campaign()
         for stage in ("examine", "execute", "validate", "final_validate"):
@@ -606,6 +613,22 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertEqual(c["repair_no"], 1)
         self.assertFalse(c["last_gate_result"]["ok"])
         self.assertEqual(c["last_gate_result"]["commands"][-1]["exit_code"], 1)
+        board = kbc.connect(board="default")
+        try:
+            repair = kb.get_task(board, c["active_task_id"])
+        finally:
+            board.close()
+        assert repair is not None
+        repair_body = repair.body or ""
+        self.assertIn("REPAIR SCOPE FROM FAILED VALIDATION", repair_body)
+        self.assertIn("Command: false", repair_body)
+        self.assertIn("exit: 1", repair_body)
+
+    def test_campaign_process_lock_is_non_blocking(self):
+        with controller._campaign_process_lock("ql_lock_test") as first:
+            self.assertTrue(first)
+            with controller._campaign_process_lock("ql_lock_test") as second:
+                self.assertFalse(second)
 
 
 if __name__ == "__main__":

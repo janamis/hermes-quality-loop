@@ -16,7 +16,7 @@ The controller registers `on_kanban_dispatch_tick` and never calls an LLM itself
 
 ## Requirements
 
-- Hermes Agent 0.21 or newer
+- Hermes Agent 0.21.3 or newer
 - Hermes Kanban enabled
 - One configured Hermes worker profile
 - Three model names that the profile's provider can route

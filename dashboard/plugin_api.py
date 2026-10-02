@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Optional
@@ -10,10 +11,30 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+CONTROLLER_MODULE = "hermes_quality_loop_controller"
 
-import quality_loop_controller as controller  # noqa: E402
+
+def _load_controller():
+    existing = sys.modules.get(CONTROLLER_MODULE)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        CONTROLLER_MODULE,
+        ROOT / "quality_loop_controller.py",
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not create the Quality Loop controller module spec")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[CONTROLLER_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(CONTROLLER_MODULE, None)
+        raise
+    return module
+
+
+controller = _load_controller()
 
 router = APIRouter()
 
