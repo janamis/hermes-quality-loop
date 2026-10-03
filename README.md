@@ -42,12 +42,16 @@ Then enable `quality-loop` for the profile you use with Hermes Desktop.
 
 Open **Capabilities → Plugins**, enable **Quality Loop**, and use the new sidebar page. Enter:
 
-- an existing absolute project or worktree path;
-- the assignee profile;
-- the examination, execution, and validation model names;
+- an existing project or worktree selected with the native folder browser, or entered as an absolute path;
+- the assignee profile from the live Hermes profile picker;
+- one shared provider and separate examination, execution, and validation models from that profile's live model catalog;
 - at least one fixed build or test command;
 - maximum rounds and repairs.
 
+The native desktop page defaults to the currently active Hermes profile and loads
+its configured provider and model catalog through the gateway. It supplements an
+incomplete live response from the profile's non-secret model cache, keeps
+provider-specific offline fallbacks, and permits manual IDs when no catalog is available.
 Model and profile fields intentionally have no machine-specific defaults.
 
 The configured build and test commands are deliberately executed by the

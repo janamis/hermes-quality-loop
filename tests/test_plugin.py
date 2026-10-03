@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import threading
 import time
@@ -23,6 +24,27 @@ spec.loader.exec_module(plugin)
 
 
 class PluginRegistrationTests(unittest.TestCase):
+    def test_desktop_ui_uses_live_profile_and_model_pickers(self):
+        source = (PLUGIN_ROOT / "desktop" / "plugin.js").read_text(encoding="utf-8")
+
+        self.assertIn("host.request('profiles.list'", source)
+        self.assertIn("host.profileRoutes()", source)
+        self.assertIn("host.requestProfile(route, 'model.options', { include_unconfigured: true })", source)
+        self.assertIn("host.request('model.options', { include_unconfigured: true })", source)
+        self.assertIn("/model-catalog?profile=", source)
+        self.assertIn("OFFLINE_MODEL_FALLBACKS", source)
+        self.assertNotIn("refetchInterval: 10000", source)
+        self.assertIn("models available from", source)
+        self.assertIn("pluginOs.pickOpenPath", source)
+        self.assertIn("directories: true", source)
+        self.assertIn("Browse…", source)
+        self.assertNotIn("explicit_only: true", source)
+        self.assertIn("SelectTrigger", source)
+        self.assertIn("SelectItem", source)
+        self.assertIn("onCheckedChange: setPublishOnSuccess", source)
+        self.assertNotIn("useState('qwen3.5:122b-a10b')", source)
+        self.assertNotIn("useState('glm-4.7-flash:q4_K_M')", source)
+
     def test_dispatch_tick_only_enqueues_reconcile(self):
         started = threading.Event()
         release = threading.Event()
@@ -75,6 +97,51 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(sys.path, before)
         self.assertEqual(api.controller.__name__, "hermes_quality_loop_controller")
         self.assertIs(sys.modules["hermes_quality_loop_controller"], api.controller)
+
+    def test_dashboard_api_reads_cached_profile_model_catalog(self):
+        api_spec = importlib.util.spec_from_file_location(
+            "quality_loop_dashboard_api_catalog_tested",
+            PLUGIN_ROOT / "dashboard" / "plugin_api.py",
+        )
+        assert api_spec and api_spec.loader
+        api = importlib.util.module_from_spec(api_spec)
+        api_spec.loader.exec_module(api)
+
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            cache = Path(directory) / "provider_models_cache.json"
+            cache.write_text(json.dumps({"openai-codex": {"models": ["gpt-a", "gpt-b", "gpt-a"]}}), encoding="utf-8")
+            with mock.patch.object(api, "resolve_profile_env", return_value=directory):
+                result = api.model_catalog("chatgpt", "openai-codex")
+
+        self.assertEqual(result["models"], ["gpt-a", "gpt-b"])
+
+    def test_dashboard_api_resolves_custom_provider_cache_key(self):
+        api_spec = importlib.util.spec_from_file_location(
+            "quality_loop_dashboard_api_custom_catalog_tested",
+            PLUGIN_ROOT / "dashboard" / "plugin_api.py",
+        )
+        assert api_spec and api_spec.loader
+        api = importlib.util.module_from_spec(api_spec)
+        api_spec.loader.exec_module(api)
+
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            profile_home = Path(directory)
+            (profile_home / "config.yaml").write_text(
+                "model:\n  provider: custom:litellm\n  base_url: http://litellm.example:4000/v1\n",
+                encoding="utf-8",
+            )
+            (profile_home / "provider_models_cache.json").write_text(
+                json.dumps({"custom:http://litellm.example:4000#fingerprint": {"models": ["model-a", "model-b"]}}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(api, "resolve_profile_env", return_value=directory):
+                result = api.model_catalog("lab", "custom:litellm")
+
+        self.assertEqual(result["models"], ["model-a", "model-b"])
 
 
 if __name__ == "__main__":

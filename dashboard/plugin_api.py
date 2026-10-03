@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from typing import Optional
 
+import yaml
 from fastapi import APIRouter, HTTPException
+from hermes_cli.profiles import resolve_profile_env
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +66,43 @@ class CampaignCreate(BaseModel):
 @router.get("/campaigns")
 def campaigns():
     return {"campaigns": controller.list_campaigns()}
+
+
+@router.get("/model-catalog")
+def model_catalog(profile: str, provider: str):
+    """Return non-secret cached model IDs for a Hermes profile/provider."""
+    try:
+        profile_home = Path(resolve_profile_env(profile))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Hermes profile not found") from exc
+
+    cache_path = profile_home / "provider_models_cache.json"
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"profile": profile, "provider": provider, "models": []}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="Could not read the cached model catalog") from exc
+
+    row = payload.get(provider, {}) if isinstance(payload, dict) else {}
+    if not row and provider.startswith("custom:") and isinstance(payload, dict):
+        try:
+            config = yaml.safe_load((profile_home / "config.yaml").read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            config = {}
+        model_config = config.get("model", {}) if isinstance(config, dict) else {}
+        base_url = str(model_config.get("base_url", "")).rstrip("/") if isinstance(model_config, dict) else ""
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        prefix = f"custom:{base_url}#" if base_url else ""
+        matches = [value for key, value in payload.items() if prefix and key.startswith(prefix)]
+        if len(matches) != 1:
+            matches = [value for key, value in payload.items() if key.startswith("custom:")]
+        if len(matches) == 1 and isinstance(matches[0], dict):
+            row = matches[0]
+    raw_models = row.get("models", []) if isinstance(row, dict) else []
+    models = list(dict.fromkeys(str(model) for model in raw_models if model))
+    return {"profile": profile, "provider": provider, "models": models}
 
 
 @router.post("/campaigns")
