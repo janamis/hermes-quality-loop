@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
@@ -67,6 +68,9 @@ CREATE TABLE IF NOT EXISTS campaigns (
     max_repairs INTEGER NOT NULL DEFAULT 3,
     active_task_id TEXT,
     proposal_task_id TEXT,
+    selected_improvement TEXT,
+    slice_index INTEGER NOT NULL DEFAULT 0,
+    slice_count INTEGER NOT NULL DEFAULT 0,
     processed_run_id INTEGER,
     final_mode INTEGER NOT NULL DEFAULT 0,
     message TEXT,
@@ -107,6 +111,9 @@ def _conn() -> sqlite3.Connection:
         "publish_branch": "TEXT",
         "commit_message": "TEXT NOT NULL DEFAULT 'quality-loop: reach target quality average'",
         "last_publish_result": "TEXT",
+        "selected_improvement": "TEXT",
+        "slice_index": "INTEGER NOT NULL DEFAULT 0",
+        "slice_count": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in migrations.items():
         if name not in existing:
@@ -175,13 +182,15 @@ def _row_dict(row: sqlite3.Row | None) -> Optional[dict[str, Any]]:
             out["last_gate_result"] = json.loads(raw_gates)
         except (TypeError, json.JSONDecodeError):
             out["last_gate_result"] = {"ok": False, "error": "invalid stored gate result"}
-    for name in ("last_ranking", "last_publish_result"):
+    for name in ("last_ranking", "last_publish_result", "selected_improvement"):
         raw = out.get(name)
         if raw:
             try:
                 out[name] = json.loads(raw)
             except (TypeError, json.JSONDecodeError):
-                out[name] = {"ok": False, "error": f"invalid stored {name}"}
+                out[name] = None if name == "selected_improvement" else {
+                    "ok": False, "error": f"invalid stored {name}"
+                }
     return out
 
 
@@ -425,24 +434,29 @@ Score every category independently from 0.0 to 10.0 using concrete repository ev
 - user_experience_performance: observable UX, responsiveness, resource use
 The controller computes the simple arithmetic average; do not provide or choose the average yourself.
 If the expected average is below {float(target):g}, return verdict "proposal" with 1 to 5
-independently executable improvement_items ordered by priority. Each item must address exactly one
-behavior or defect, have its own acceptance criteria, and be small enough for one focused execution
-card. The controller activates only the highest-priority item, validates it, and then starts a fresh
-examination; lower-priority items are findings for reconsideration, not executor scope.
+improvement_items ordered by priority. Each item must address exactly one behavior or defect and have
+its own acceptance criteria. Prefer one focused execution card. Only when the selected item cannot be
+safely completed and verified in one card, add 2 to 5 execution_slices. Every slice must be independently
+executable, change one coherent behavior, name its own acceptance criteria, and touch the minimum files.
+Order slices by dependency. The controller activates only the highest-priority item, runs exactly one
+slice at a time, validates each slice before activating the next, then runs one integrated validation
+before a fresh examination. Lower-priority items are findings for reconsideration, not executor scope.
 If the expected average is at least {float(target):g}, return verdict "candidate_complete"; the
 configured validator ({validator}) will still perform a final independent validation.
 {completion_action}
 Complete with metadata exactly shaped as:
-{{"quality_loop": {{"schema": "{SCHEMA}", "role": "examine", "verdict": "proposal|candidate_complete", "score_breakdown": {{{categories}}}, "score_rationale": "evidence for every category", "improvement_items": [{{"priority": 1, "title": "single focused item", "implementation_prompt": "implement only this item", "acceptance_criteria": ["item-specific check"], "relevant_files": ["..."], "risks": ["..."]}}]}}}}
+{{"quality_loop": {{"schema": "{SCHEMA}", "role": "examine", "verdict": "proposal|candidate_complete", "score_breakdown": {{{categories}}}, "score_rationale": "evidence for every category", "improvement_items": [{{"priority": 1, "title": "one improvement", "implementation_prompt": "implement only this item", "acceptance_criteria": ["item-level integrated check"], "relevant_files": ["..."], "risks": ["..."], "execution_slices": [{{"title": "atomic slice", "implementation_prompt": "one coherent change", "acceptance_criteria": ["slice-specific check"], "relevant_files": ["..."]}}]}}]}}}}
 All five score_breakdown keys are mandatory and each value must be numeric from 0 through 10.
 """
         return header + f"""
 Examine the CURRENT codebase thoroughly. Do not modify source files.
-Return 1 to 5 independently executable improvement_items ordered by priority. Each item must cover
-exactly one behavior or defect. The controller activates only the highest-priority item and requests
-a fresh examination after it is validated.
+Return 1 to 5 improvement_items ordered by priority. Each item must cover exactly one behavior or
+defect. Prefer one focused execution card. Only when an item genuinely requires dependent steps, add
+2 to 5 independently executable execution_slices, each with its own prompt, acceptance criteria, and
+minimal relevant files. The controller activates only the highest-priority item, validates every slice
+before starting the next, runs an integrated validation, and then requests a fresh examination.
 If meaningful work remains, complete with metadata exactly shaped as:
-{{"quality_loop": {{"schema": "{SCHEMA}", "role": "examine", "verdict": "proposal", "improvement_items": [{{"priority": 1, "title": "single focused item", "implementation_prompt": "implement only this item", "acceptance_criteria": ["item-specific check"], "relevant_files": ["..."], "risks": ["..."]}}]}}}}
+{{"quality_loop": {{"schema": "{SCHEMA}", "role": "examine", "verdict": "proposal", "improvement_items": [{{"priority": 1, "title": "one improvement", "implementation_prompt": "implement only this item", "acceptance_criteria": ["integrated check"], "relevant_files": ["..."], "risks": ["..."], "execution_slices": [{{"title": "atomic slice", "implementation_prompt": "one coherent change", "acceptance_criteria": ["slice-specific check"], "relevant_files": ["..."]}}]}}]}}}}
 If no critical or high-value work remains, use verdict "candidate_complete" and explain why.
 Do not use candidate_complete merely because the repository is large or unfamiliar.
 """
@@ -453,7 +467,12 @@ Stay within scope, modify the code, add/update tests, and run relevant verificat
 Complete with a concise summary and metadata shaped as:
 {{"quality_loop": {{"schema": "{SCHEMA}", "role": "execute", "changed_files": ["..."], "verification": [{{"command": "...", "exit_code": 0}}], "residual_risk": ["..."]}}}}
 """
-    final_text = "This is the FINAL whole-codebase audit." if stage == "final_validate" else "Validate the proposed implementation."
+    if stage == "final_validate":
+        final_text = "This is the FINAL whole-codebase audit."
+    elif stage == "integrate_validate":
+        final_text = "This is the INTEGRATED VALIDATION of all validated slices for one selected improvement."
+    else:
+        final_text = "Validate the proposed implementation."
     gate_lines = "\n".join(
         f"- {name}: `{command}`"
         for name, command in (("build", c.get("build_command")), ("test", c.get("test_command")))
@@ -479,12 +498,35 @@ build passes or fails; tests pass or fail; acceptance criteria met or unmet; 0 c
 """
 
 
-def _priority_improvement(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Select one independently executable examiner item.
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
-    New handoffs carry an ordered/numbered list. Legacy handoffs remain accepted as one item so
-    in-flight campaigns can be reconciled after a controller upgrade. When the new field is present
-    but malformed, do not fall back to a broad legacy prompt.
+
+def _normalize_slice(raw: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    title = str(raw.get("title") or "").strip()
+    prompt = str(raw.get("implementation_prompt") or "").strip()
+    criteria = _string_list(raw.get("acceptance_criteria"))
+    if not title or not prompt or not criteria:
+        return None
+    return {
+        "title": title,
+        "implementation_prompt": prompt,
+        "acceptance_criteria": criteria,
+        "relevant_files": _string_list(raw.get("relevant_files")),
+        "risks": _string_list(raw.get("risks")),
+    }
+
+
+def _priority_improvement(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Select and normalize one examiner item, including an optional serial slice plan.
+
+    Legacy handoffs remain accepted as one item so in-flight campaigns can be reconciled after a
+    controller upgrade. A present but malformed improvement_items or execution_slices field is never
+    widened into the legacy broad prompt.
     """
     if "improvement_items" in payload:
         raw_items = payload.get("improvement_items")
@@ -494,14 +536,8 @@ def _priority_improvement(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
         for index, raw in enumerate(raw_items):
             if not isinstance(raw, dict):
                 continue
-            title = str(raw.get("title") or "").strip()
-            prompt = str(raw.get("implementation_prompt") or "").strip()
-            criteria = [
-                str(value).strip()
-                for value in (raw.get("acceptance_criteria") or [])
-                if str(value).strip()
-            ] if isinstance(raw.get("acceptance_criteria"), list) else []
-            if not title or not prompt or not criteria:
+            normalized = _normalize_slice(raw)
+            if not normalized:
                 continue
             raw_priority = raw.get("priority", index + 1)
             if isinstance(raw_priority, bool):
@@ -512,48 +548,65 @@ def _priority_improvement(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
                 continue
             if not math.isfinite(priority) or priority < 1:
                 continue
-            relevant_files = [
-                str(value).strip()
-                for value in (raw.get("relevant_files") or [])
-                if str(value).strip()
-            ] if isinstance(raw.get("relevant_files"), list) else []
-            risks = [
-                str(value).strip()
-                for value in (raw.get("risks") or [])
-                if str(value).strip()
-            ] if isinstance(raw.get("risks"), list) else []
-            candidates.append((priority, index, {
-                "priority": priority,
-                "title": title,
-                "implementation_prompt": prompt,
-                "acceptance_criteria": criteria,
-                "relevant_files": relevant_files,
-                "risks": risks,
-            }))
+
+            item: dict[str, Any] = {"priority": priority, **normalized}
+            if "execution_slices" in raw:
+                raw_slices = raw.get("execution_slices")
+                if not isinstance(raw_slices, list) or not 2 <= len(raw_slices) <= 5:
+                    continue
+                slices = [_normalize_slice(value) for value in raw_slices]
+                if any(value is None for value in slices):
+                    continue
+                item["execution_slices"] = [value for value in slices if value is not None]
+            candidates.append((priority, index, item))
         return min(candidates, key=lambda value: (value[0], value[1]))[2] if candidates else None
 
     prompt = str(payload.get("implementation_prompt") or "").strip()
     if not prompt:
         return None
-    criteria = payload.get("acceptance_criteria")
+    criteria = _string_list(payload.get("acceptance_criteria"))
     return {
         "priority": 1.0,
         "title": "Legacy examiner proposal",
         "implementation_prompt": prompt,
-        "acceptance_criteria": [str(value).strip() for value in criteria if str(value).strip()]
-        if isinstance(criteria, list) else ["Implement and verify the focused proposal."],
-        "relevant_files": [str(value).strip() for value in (payload.get("relevant_files") or []) if str(value).strip()]
-        if isinstance(payload.get("relevant_files"), list) else [],
-        "risks": [str(value).strip() for value in (payload.get("risks") or []) if str(value).strip()]
-        if isinstance(payload.get("risks"), list) else [],
+        "acceptance_criteria": criteria or ["Implement and verify the focused proposal."],
+        "relevant_files": _string_list(payload.get("relevant_files")),
+        "risks": _string_list(payload.get("risks")),
     }
+
+
+def _execution_slices(item: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = item.get("execution_slices")
+    if isinstance(raw, list) and raw:
+        return [value for value in raw if isinstance(value, dict)]
+    return [item]
+
+
+def _slice_item(item: dict[str, Any], index: int) -> Optional[dict[str, Any]]:
+    slices = _execution_slices(item)
+    if not 0 <= index < len(slices):
+        return None
+    selected = dict(slices[index])
+    selected["slice_index"] = index
+    selected["slice_count"] = len(slices)
+    selected["parent_title"] = item.get("title")
+    return selected
 
 
 def _execute_item_body(c: dict[str, Any], item: dict[str, Any]) -> str:
     criteria = "\n".join(f"- {value}" for value in item["acceptance_criteria"])
     files = "\n".join(f"- {value}" for value in item.get("relevant_files", [])) or "- Determine the minimum files needed for this item."
     risks = "\n".join(f"- {value}" for value in item.get("risks", [])) or "- None supplied by the examiner."
+    slice_count = int(item.get("slice_count") or 1)
+    slice_index = int(item.get("slice_index") or 0)
+    if item.get("integrated_repair"):
+        scope_heading = "INTEGRATED REPAIR"
+    elif slice_count > 1:
+        scope_heading = f"SEQUENTIAL SLICE {slice_index + 1} OF {slice_count}"
+    else:
+        scope_heading = "SELECTED ITEM"
     return f"""
+{scope_heading}
 HIGHEST-PRIORITY ITEM: {item['title']}
 
 Implement only this independently scoped item:
@@ -595,6 +648,30 @@ If this selected item is not complete, return FAIL with a correction_prompt. Do 
 """
 
 
+def _integration_validation_body(item: dict[str, Any]) -> str:
+    lines: list[str] = []
+    for index, value in enumerate(_execution_slices(item), start=1):
+        criteria = "; ".join(value.get("acceptance_criteria", []))
+        lines.append(f"{index}. {value['title']}: {criteria}")
+    item_criteria = "\n".join(f"- {value}" for value in item["acceptance_criteria"])
+    return f"""
+INTEGRATED VALIDATION: {item['title']}
+
+All component slices already passed their focused validators. Validate that they now work together
+as one coherent change and that no cross-slice regression or unintended file change remains.
+
+Validated slices:
+{chr(10).join(lines)}
+
+Item-level acceptance criteria:
+{item_criteria}
+
+Inspect the complete git diff for this selected improvement and run the configured full hard gates.
+Do not reopen lower-priority examiner findings. If integration is incomplete, return FAIL with one
+precise correction_prompt; do not repair it.
+"""
+
+
 def _repair_body(correction: str) -> str:
     return f"""
 REPAIR SCOPE FROM FAILED VALIDATION:
@@ -606,6 +683,9 @@ item's scope. The controller will create a fresh independent validation card aft
 
 
 def _selected_campaign_improvement(c: dict[str, Any]) -> Optional[dict[str, Any]]:
+    stored = c.get("selected_improvement")
+    if isinstance(stored, dict):
+        return stored
     proposal_task_id = c.get("proposal_task_id")
     if not proposal_task_id:
         return None
@@ -618,27 +698,60 @@ def _selected_campaign_improvement(c: dict[str, Any]) -> Optional[dict[str, Any]
     return _priority_improvement(payload or {})
 
 
+def _current_campaign_slice(c: dict[str, Any]) -> Optional[dict[str, Any]]:
+    item = _selected_campaign_improvement(c)
+    if not item:
+        return None
+    return _slice_item(item, int(c.get("slice_index") or 0))
+
+
 def _create_task(
     c: dict[str, Any],
     stage: str,
     parents: list[str],
     improvement: Optional[dict[str, Any]] = None,
     correction: str = "",
+    integration_validation: bool = False,
 ) -> str:
     model_key = {
         "examine": "examiner_model",
         "execute": "executor_model",
         "validate": "validator_model",
+        "integrate_validate": "validator_model",
         "final_validate": "validator_model",
     }[stage]
     label = {
         "examine": "Examine current codebase and propose next prompt",
         "execute": "Execute proposed implementation prompt",
         "validate": "Validate implementation",
+        "integrate_validate": "Validate integrated improvement",
         "final_validate": "Final whole-codebase validation",
     }[stage]
-    suffix = f"repair {c['repair_no']}" if stage == "execute" and c.get("repair_no", 0) else f"round {c['round_no']}"
-    key = f"quality-loop:{c['id']}:{stage}:r{c['round_no']}:p{c['repair_no']}"
+    if stage == "execute" and improvement and int(improvement.get("slice_count") or 1) > 1:
+        slice_label = (
+            f"slice {int(improvement.get('slice_index') or 0) + 1}/"
+            f"{int(improvement['slice_count'])}"
+        )
+        suffix = (
+            f"{slice_label}, repair {c['repair_no']}"
+            if c.get("repair_no", 0)
+            else slice_label
+        )
+    elif stage == "execute" and c.get("repair_no", 0):
+        suffix = f"repair {c['repair_no']}"
+    else:
+        suffix = f"round {c['round_no']}"
+    lineage = json.dumps(
+        {"parents": sorted(parents), "improvement": improvement or {}},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    lineage_hash = hashlib.sha256(lineage.encode("utf-8")).hexdigest()[:12]
+    key = (
+        f"quality-loop:{c['id']}:{stage}:r{c['round_no']}:"
+        f"p{c['repair_no']}:l{lineage_hash}"
+    )
     conn = kbc.connect(board=c["board"])
     try:
         return kb.create_task(
@@ -649,6 +762,7 @@ def _create_task(
                 + (_execute_item_body(c, improvement) if stage == "execute" and improvement else "")
                 + (_repair_body(correction) if stage == "execute" and correction else "")
                 + (_validation_item_body(improvement) if stage == "validate" and improvement else "")
+                + (_integration_validation_body(improvement) if integration_validation and improvement else "")
             ),
             assignee=c["assignee"],
             created_by="quality-loop",
@@ -1053,6 +1167,34 @@ def _pause(c: dict[str, Any], message: str, state: str = "needs_review", run_id:
     _update(c["id"], **fields)
 
 
+def _queue_next_examination(c: dict[str, Any], parent_id: str, run_id: int | None) -> None:
+    if c["round_no"] >= c["max_rounds"]:
+        _pause(
+            c,
+            "Maximum rounds reached after a passing change; final completion was not yet declared",
+            state="max_rounds",
+            run_id=run_id,
+        )
+        return
+    next_round = c["round_no"] + 1
+    next_campaign = dict(c, round_no=next_round, repair_no=0, final_mode=False)
+    task_id = _create_task(next_campaign, "examine", [parent_id])
+    _update(
+        c["id"],
+        stage="examine",
+        active_task_id=task_id,
+        proposal_task_id=None,
+        selected_improvement=None,
+        slice_index=0,
+        slice_count=0,
+        round_no=next_round,
+        repair_no=0,
+        processed_run_id=run_id,
+        final_mode=0,
+        message=f"Integrated validation passed; round {next_round} fresh examination ready",
+    )
+
+
 def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]:
     with _LOCK:
         c = get_campaign(campaign_id)
@@ -1121,11 +1263,15 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                 elif verdict == "proposal" and improvement:
                     c["last_average"] = average
                     c["last_ranking"] = ranking
-                    task_id = _create_task(c, "execute", [task.id], improvement=improvement)
+                    slices = _execution_slices(improvement)
+                    current_slice = _slice_item(improvement, 0)
+                    task_id = _create_task(c, "execute", [task.id], improvement=current_slice)
                     _update(
                         campaign_id,
                         stage="execute", active_task_id=task_id, proposal_task_id=task.id,
                         processed_run_id=run.id if run else None, final_mode=0,
+                        selected_improvement=json.dumps(improvement, sort_keys=True),
+                        slice_index=0, slice_count=len(slices), repair_no=0,
                         last_average=average, last_ranking=json.dumps(ranking, sort_keys=True),
                         message=(
                             f"Computed ranking average {average:g}/10 is below target "
@@ -1146,11 +1292,15 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                         run_id=run.id if run else None,
                     )
             elif verdict == "proposal" and improvement:
-                task_id = _create_task(c, "execute", [task.id], improvement=improvement)
+                slices = _execution_slices(improvement)
+                current_slice = _slice_item(improvement, 0)
+                task_id = _create_task(c, "execute", [task.id], improvement=current_slice)
                 _update(
                     campaign_id,
                     stage="execute", active_task_id=task_id, proposal_task_id=task.id,
                     processed_run_id=run.id if run else None, final_mode=0,
+                    selected_improvement=json.dumps(improvement, sort_keys=True),
+                    slice_index=0, slice_count=len(slices), repair_no=0,
                     message="Proposal accepted; execution card ready",
                 )
             elif verdict == "candidate_complete":
@@ -1167,26 +1317,40 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                 _pause(c, "Examiner did not return a valid proposal or candidate_complete payload", run_id=run.id if run else None)
 
         elif stage == "execute":
-            validate_stage = "final_validate" if c["final_mode"] else "validate"
-            improvement = None if c["final_mode"] else _selected_campaign_improvement(c)
-            if validate_stage == "validate" and not improvement:
+            if c["final_mode"]:
+                validate_stage = "final_validate"
+                improvement = None
+                integration_validation = False
+            elif int(c.get("slice_index") or 0) >= int(c.get("slice_count") or 0) > 0:
+                validate_stage = "integrate_validate"
+                improvement = _selected_campaign_improvement(c)
+                integration_validation = True
+            else:
+                validate_stage = "validate"
+                improvement = _current_campaign_slice(c)
+                integration_validation = False
+            if validate_stage != "final_validate" and not improvement:
                 _pause(
                     c,
                     "Cannot create a scoped validator: the selected examiner improvement is missing or invalid",
                     run_id=run.id if run else None,
                 )
                 return get_campaign(campaign_id)
-            # Do not link the broad examiner handoff into validator context. The one selected
-            # item is copied into this card's body, and the completed executor is its sole parent.
-            parents = [task.id]
-            task_id = _create_task(c, validate_stage, parents, improvement=improvement)
+            # Validators depend only on the just-completed executor. Scope is copied into the body.
+            task_id = _create_task(
+                c,
+                validate_stage,
+                [task.id],
+                improvement=improvement,
+                integration_validation=integration_validation,
+            )
             _update(
                 campaign_id, stage=validate_stage, active_task_id=task_id,
                 processed_run_id=run.id if run else None,
                 message="Execution complete; validation card ready",
             )
 
-        elif stage in {"validate", "final_validate"}:
+        elif stage in {"validate", "integrate_validate", "final_validate"}:
             payload = _handoff(run, expected_role="validate")
             if not payload:
                 payload = _worker_comment_handoff(
@@ -1253,20 +1417,54 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                                 + score_text
                             ),
                         )
-                elif c["round_no"] >= c["max_rounds"]:
-                    _pause(c, "Maximum rounds reached after a passing change; final completion was not yet declared", state="max_rounds", run_id=run.id if run else None)
-                else:
-                    next_round = c["round_no"] + 1
-                    c["round_no"] = next_round
-                    c["repair_no"] = 0
-                    c["final_mode"] = False
-                    task_id = _create_task(c, "examine", [task.id])
-                    _update(
-                        campaign_id, stage="examine", active_task_id=task_id,
-                        proposal_task_id=None, round_no=next_round, repair_no=0,
-                        processed_run_id=run.id if run else None, final_mode=0,
-                        message=f"Validation passed; round {next_round} examination ready",
-                    )
+                elif stage == "validate":
+                    selected = _selected_campaign_improvement(c)
+                    slices = _execution_slices(selected) if selected else []
+                    slice_index = int(c.get("slice_index") or 0)
+                    if len(slices) > 1 and 0 <= slice_index < len(slices) - 1:
+                        next_index = slice_index + 1
+                        c["slice_index"] = next_index
+                        c["repair_no"] = 0
+                        next_slice = _slice_item(selected, next_index) if selected else None
+                        task_id = _create_task(c, "execute", [task.id], improvement=next_slice)
+                        _update(
+                            campaign_id,
+                            stage="execute",
+                            active_task_id=task_id,
+                            slice_index=next_index,
+                            repair_no=0,
+                            processed_run_id=run.id if run else None,
+                            message=(
+                                f"Slice {slice_index + 1}/{len(slices)} validated; "
+                                f"slice {next_index + 1}/{len(slices)} ready"
+                            ),
+                        )
+                    elif len(slices) > 1 and slice_index == len(slices) - 1:
+                        c["slice_index"] = len(slices)
+                        c["repair_no"] = 0
+                        task_id = _create_task(
+                            c,
+                            "integrate_validate",
+                            [task.id],
+                            improvement=selected,
+                            integration_validation=True,
+                        )
+                        _update(
+                            campaign_id,
+                            stage="integrate_validate",
+                            active_task_id=task_id,
+                            slice_index=len(slices),
+                            repair_no=0,
+                            processed_run_id=run.id if run else None,
+                            message=(
+                                f"All {len(slices)} slices passed focused validation; "
+                                "integrated validation ready"
+                            ),
+                        )
+                    else:
+                        _queue_next_examination(c, task.id, run.id if run else None)
+                elif stage == "integrate_validate":
+                    _queue_next_examination(c, task.id, run.id if run else None)
             else:
                 next_repair = c["repair_no"] + 1
                 if next_repair > c["max_repairs"]:
@@ -1283,9 +1481,23 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                     if not correction:
                         findings = payload.get("findings") or []
                         correction = "Correct all validator findings: " + "; ".join(map(str, findings))
-                    # The failed validator handoff is the repair executor's parent context.
+                    # The failed validator handoff is the repair executor's sole parent context.
                     c["repair_no"] = next_repair
-                    task_id = _create_task(c, "execute", [task.id], correction=correction)
+                    repair_scope: Optional[dict[str, Any]] = None
+                    if stage == "validate":
+                        repair_scope = _current_campaign_slice(c)
+                    elif stage == "integrate_validate":
+                        selected = _selected_campaign_improvement(c)
+                        if selected:
+                            repair_scope = dict(selected)
+                            repair_scope["integrated_repair"] = True
+                    task_id = _create_task(
+                        c,
+                        "execute",
+                        [task.id],
+                        improvement=repair_scope,
+                        correction=correction,
+                    )
                     _update(
                         campaign_id, stage="execute", active_task_id=task_id,
                         repair_no=next_repair, processed_run_id=run.id if run else None,

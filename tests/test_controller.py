@@ -35,17 +35,53 @@ from hermes_cli import kanban_db_connect as kbc  # noqa: E402
 class QualityLoopControllerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.old_home = os.environ.get("HERMES_HOME")
+        self._env = {
+            name: os.environ.get(name)
+            for name in (
+                "HERMES_HOME",
+                "HERMES_KANBAN_DB",
+                "HERMES_KANBAN_BOARD",
+                "HERMES_KANBAN_TASK",
+                "HERMES_DELEGATED_CHILD_CONTEXT",
+            )
+        }
         os.environ["HERMES_HOME"] = self.temp.name
+        for name in self._env:
+            if name != "HERMES_HOME":
+                os.environ.pop(name, None)
         self.workspace = Path(self.temp.name) / "repo"
         self.workspace.mkdir()
         (self.workspace / ".git").mkdir()
+        self._real_kanban_connect = kbc.connect
+        self._patchers = [
+            mock.patch.object(
+                controller,
+                "get_default_hermes_root",
+                side_effect=lambda: (
+                    Path(os.environ["HERMES_HOME"]).parent.parent
+                    if Path(os.environ["HERMES_HOME"]).parent.name == "profiles"
+                    else Path(os.environ["HERMES_HOME"])
+                ),
+            ),
+            mock.patch.object(
+                kbc,
+                "connect",
+                side_effect=lambda db_path=None, *, board=None: self._real_kanban_connect(
+                    Path(self.temp.name) / "kanban.db"
+                ),
+            ),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
 
     def tearDown(self):
-        if self.old_home is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = self.old_home
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+        for name, value in self._env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         self.temp.cleanup()
 
     def create_campaign(self, **overrides):
@@ -111,6 +147,39 @@ class QualityLoopControllerTests(unittest.TestCase):
                 scores = {name: float(scores) for name in controller.RANKING_CATEGORIES}
             payload["score_breakdown"] = scores
             payload["score_rationale"] = "Deterministic test scores"
+        return payload
+
+    def sliced_proposal(self):
+        payload = self.proposal()
+        payload["improvement_items"] = [
+            {
+                "priority": 1,
+                "title": "Production-backed quadtree tests",
+                "implementation_prompt": "Replace mock-only tests with production-backed coverage.",
+                "acceptance_criteria": ["All three slices work together", "full suite passes"],
+                "relevant_files": ["server.js", "tests/quadtree-slicing.test.js", "package.json"],
+                "execution_slices": [
+                    {
+                        "title": "Export the production seam",
+                        "implementation_prompt": "Export existing functions without changing behavior.",
+                        "acceptance_criteria": ["server import is safe", "exports are present"],
+                        "relevant_files": ["server.js"],
+                    },
+                    {
+                        "title": "Use production functions in tests",
+                        "implementation_prompt": "Replace local doubles with imports from server.js.",
+                        "acceptance_criteria": ["tests call production functions"],
+                        "relevant_files": ["tests/quadtree-slicing.test.js"],
+                    },
+                    {
+                        "title": "Integrate the test runner",
+                        "implementation_prompt": "Wire the standalone test into the package runner.",
+                        "acceptance_criteria": ["documented test command passes"],
+                        "relevant_files": ["package.json", "package-lock.json"],
+                    },
+                ],
+            }
+        ]
         return payload
 
     def passing_validation(self):
@@ -292,6 +361,127 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertIn("return FAIL", body)
         self.assertIn("lower-priority", body)
         self.assertNotIn("Implement comparison behavior later.", body)
+
+    def test_slices_run_serially_then_integrated_validation_then_fresh_examination(self):
+        c = self.create_campaign()
+        examiner_id = c["active_task_id"]
+        c = self.complete(c, self.sliced_proposal())
+        self.assertEqual((c["stage"], c["slice_index"], c["slice_count"]), ("execute", 0, 3))
+
+        board = kbc.connect(board="default")
+        try:
+            first_executor = kb.get_task(board, c["active_task_id"])
+            first_parents = board.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (c["active_task_id"],)
+            ).fetchall()
+        finally:
+            board.close()
+        self.assertEqual([row["parent_id"] for row in first_parents], [examiner_id])
+        self.assertIn("SEQUENTIAL SLICE 1 OF 3", first_executor.body)
+        self.assertNotIn("Use production functions in tests", first_executor.body)
+
+        c = self.complete(c, {"schema": controller.SCHEMA, "role": "execute"})
+        first_validator_id = c["active_task_id"]
+        c = self.complete(c, self.passing_validation())
+        self.assertEqual((c["stage"], c["slice_index"], c["repair_no"]), ("execute", 1, 0))
+        board = kbc.connect(board="default")
+        try:
+            second_executor = kb.get_task(board, c["active_task_id"])
+            second_parents = board.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (c["active_task_id"],)
+            ).fetchall()
+        finally:
+            board.close()
+        self.assertEqual([row["parent_id"] for row in second_parents], [first_validator_id])
+        self.assertIn("SEQUENTIAL SLICE 2 OF 3", second_executor.body)
+
+        c = self.complete(c, {"schema": controller.SCHEMA, "role": "execute"})
+        c = self.complete(c, self.passing_validation())
+        self.assertEqual((c["stage"], c["slice_index"]), ("execute", 2))
+        self.assertIn("slice 3/3", c["active_task"]["title"])
+
+        c = self.complete(c, {"schema": controller.SCHEMA, "role": "execute"})
+        last_validator_id = c["active_task_id"]
+        c = self.complete(c, self.passing_validation())
+        self.assertEqual((c["stage"], c["slice_index"]), ("integrate_validate", 3))
+        board = kbc.connect(board="default")
+        try:
+            integrated = kb.get_task(board, c["active_task_id"])
+            integrated_parents = board.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (c["active_task_id"],)
+            ).fetchall()
+        finally:
+            board.close()
+        self.assertEqual([row["parent_id"] for row in integrated_parents], [last_validator_id])
+        self.assertIn("INTEGRATED VALIDATION", integrated.body)
+        self.assertIn("Export the production seam", integrated.body)
+        self.assertIn("Integrate the test runner", integrated.body)
+        self.assertIn("READ-ONLY VALIDATOR", integrated.body)
+
+        c = self.complete(c, self.passing_validation())
+        self.assertEqual((c["state"], c["stage"], c["round_no"]), ("running", "examine", 2))
+        self.assertEqual((c["slice_index"], c["slice_count"]), (0, 0))
+        self.assertIsNone(c["selected_improvement"])
+
+    def test_failed_slice_repairs_same_slice_before_advancing(self):
+        c = self.create_campaign()
+        c = self.complete(c, self.sliced_proposal())
+        c = self.complete(c, {"schema": controller.SCHEMA, "role": "execute"})
+        failure = {
+            "schema": controller.SCHEMA,
+            "role": "validate",
+            "verdict": "fail",
+            "build_passed": True,
+            "tests_passed": False,
+            "critical_issues": 0,
+            "high_issues": 0,
+            "regressions": 1,
+            "correction_prompt": "Make server import safe without starting the listener.",
+        }
+        c = self.complete(c, failure)
+        self.assertEqual((c["stage"], c["slice_index"], c["repair_no"]), ("execute", 0, 1))
+        board = kbc.connect(board="default")
+        try:
+            repair = kb.get_task(board, c["active_task_id"])
+        finally:
+            board.close()
+        self.assertIn("Export the production seam", repair.body)
+        self.assertIn("Make server import safe", repair.body)
+        self.assertNotIn("Use production functions in tests", repair.body)
+
+        c = self.complete(c, {"schema": controller.SCHEMA, "role": "execute"})
+        self.assertEqual((c["stage"], c["slice_index"]), ("validate", 0))
+
+    def test_failed_integrated_validation_repairs_then_revalidates_integration(self):
+        c = self.create_campaign()
+        c = self.complete(c, self.sliced_proposal())
+        for _ in range(3):
+            c = self.complete(c, {"schema": controller.SCHEMA, "role": "execute"})
+            c = self.complete(c, self.passing_validation())
+        self.assertEqual(c["stage"], "integrate_validate")
+        failure = {
+            "schema": controller.SCHEMA,
+            "role": "validate",
+            "verdict": "fail",
+            "build_passed": True,
+            "tests_passed": False,
+            "critical_issues": 0,
+            "high_issues": 0,
+            "regressions": 1,
+            "correction_prompt": "Fix the cross-slice package test command.",
+        }
+        c = self.complete(c, failure)
+        self.assertEqual((c["stage"], c["slice_index"]), ("execute", 3))
+        board = kbc.connect(board="default")
+        try:
+            repair = kb.get_task(board, c["active_task_id"])
+        finally:
+            board.close()
+        self.assertIn("INTEGRATED REPAIR", repair.body)
+        self.assertIn("Fix the cross-slice package test command", repair.body)
+
+        c = self.complete(c, {"schema": controller.SCHEMA, "role": "execute"})
+        self.assertEqual(c["stage"], "integrate_validate")
 
     def test_ranked_campaign_at_target_average_starts_final_sol_validation(self):
         c = self.create_campaign(target_average=9.0)
@@ -593,6 +783,35 @@ class QualityLoopControllerTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(after, 1)
+
+    def test_task_idempotency_distinguishes_parent_lineage(self):
+        c = self.create_campaign()
+        first_parent = c["active_task_id"]
+        conn = kbc.connect(board="default")
+        try:
+            second_parent = kb.create_task(
+                conn,
+                title="alternate parent",
+                body="alternate lineage",
+                assignee=c["assignee"],
+                workspace_kind="dir",
+                workspace_path=str(self.workspace),
+                board="default",
+            )
+        finally:
+            conn.close()
+
+        improvement = {
+            "title": "Focused improvement",
+            "implementation_prompt": "Implement one bounded change.",
+            "acceptance_criteria": ["focused test passes"],
+        }
+        first = controller._create_task(c, "execute", [first_parent], improvement=improvement)
+        repeated = controller._create_task(c, "execute", [first_parent], improvement=improvement)
+        alternate = controller._create_task(c, "execute", [second_parent], improvement=improvement)
+
+        self.assertEqual(repeated, first)
+        self.assertNotEqual(alternate, first)
 
     def test_manual_stop_prevents_new_cards(self):
         c = self.create_campaign()

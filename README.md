@@ -5,14 +5,24 @@ Quality Loop is a Hermes Agent plugin for durable code-quality campaigns on the 
 ## Workflow
 
 1. **Examine** the current codebase with the configured examination model.
-2. **Execute** the highest-priority proposed improvement with the coding model.
-3. **Validate** independently with the validation model.
-4. On failure, create a bounded repair card and revalidate.
-5. On pass, start the next examination round.
-6. When the examiner returns `candidate_complete`, require a final whole-codebase validation.
-7. Finish only when the final validator passes **and** the configured build/test commands return exit code 0.
+2. Select exactly one highest-priority improvement. Prefer one focused executor card; when a safe
+   implementation requires dependent steps, the examiner may define 2–5 ordered atomic slices.
+3. **Execute one slice at a time** with the coding model. Only the current slice becomes ready.
+4. **Validate every slice independently** with the validation model. The next executor depends on the
+   preceding validator, so a later slice cannot start before the earlier slice passes.
+5. On focused validation failure, create a bounded repair for that same slice and revalidate it.
+6. After all slices pass, run one read-only **integrated validation** across the complete selected
+   improvement. An integration failure creates a scoped repair that preserves validated slices.
+7. Only after integrated validation passes, start a fresh examination and ranking round.
+8. When the examiner returns `candidate_complete`, require a final whole-codebase validation.
+9. Finish only when the final validator passes **and** the configured build/test commands return exit code 0.
 
-The controller registers `on_kanban_dispatch_tick` and never calls an LLM itself. Card creation uses idempotency keys so gateway retries cannot duplicate a stage.
+Legacy single-item examiner handoffs continue to run as one focused executor/validator pair before
+fresh examination. The controller persists the selected improvement and slice position so gateway
+restarts preserve ordering. Card idempotency includes parent lineage and slice scope, preventing a
+retry from reusing a stale task from a different slice.
+
+The controller registers `on_kanban_dispatch_tick` and never calls an LLM itself.
 
 ## Requirements
 
