@@ -452,7 +452,7 @@ function CreateCampaign() {
   const canStart = !create.isPending && missing.length === 0
 
   return jsxs('section', {
-    className: 'overflow-hidden rounded-xl border border-(--ui-stroke-secondary) bg-(--ui-bg-primary)',
+    className: 'rounded-xl border border-(--ui-stroke-secondary) bg-(--ui-bg-primary)',
     children: [
       jsxs('div', {
         className: 'relative overflow-hidden border-b border-(--ui-stroke-secondary) bg-(--ui-accent)/5 px-5 py-4',
