@@ -7,8 +7,9 @@ import json
 import sys
 from pathlib import Path
 from typing import Optional
+from typing import Literal
 
-import yaml
+import hermes_yaml as yaml
 from fastapi import APIRouter, HTTPException
 from hermes_cli.profiles import resolve_profile_env
 from pydantic import BaseModel, Field
@@ -56,6 +57,7 @@ class CampaignCreate(BaseModel):
     gate_timeout_seconds: int = Field(default=900, ge=10, le=3600)
     target_average: Optional[float] = Field(default=None, gt=0, le=10)
     publish_on_success: bool = False
+    prompt_profile: Literal["complete", "simple"] = "complete"
     publish_remote: str = "origin"
     publish_branch: Optional[str] = None
     commit_message: str = "quality-loop: reach target quality average"

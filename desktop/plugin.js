@@ -255,6 +255,12 @@ function CampaignCard({ campaign }) {
                 children: `Ranking: ${campaign.last_average == null ? 'not scored' : `${campaign.last_average}/10`} · target ${campaign.target_average}/10${campaign.publish_on_success ? ' · publish on final PASS' : ''}`
               })
             : null,
+          campaign.prompt_profile === 'simple'
+            ? jsx('div', {
+                className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: 'Prompts: simple (local-model wording)'
+              })
+            : null,
           jsxs('div', {
             className: 'flex flex-wrap gap-2 pt-1',
             children: [
@@ -293,6 +299,7 @@ function CreateCampaign() {
   const [rounds, setRounds] = useState('20')
   const [repairs, setRepairs] = useState('3')
   const [targetAverage, setTargetAverage] = useState('')
+  const [promptProfile, setPromptProfile] = useState('complete')
   const [publishOnSuccess, setPublishOnSuccess] = useState(false)
   const [publishRemote, setPublishRemote] = useState('origin')
   const [publishBranch, setPublishBranch] = useState('')
@@ -410,8 +417,7 @@ function CreateCampaign() {
   const missing = [
     !workspace.trim() ? 'workspace' : '',
     !assignee.trim() ? 'profile' : '',
-    !examiner.trim() || !executor.trim() || !validator.trim() ? 'models' : '',
-    !buildCommand.trim() && !testCommand.trim() ? 'a build or test gate' : ''
+    !examiner.trim() || !executor.trim() || !validator.trim() ? 'models' : ''
   ].filter(Boolean)
 
   const create = useMutation({
@@ -429,6 +435,7 @@ function CreateCampaign() {
         test_command: testCommand,
         gate_timeout_seconds: Number(gateTimeout),
         target_average: targetAverage === '' ? null : Number(targetAverage),
+        prompt_profile: promptProfile,
         publish_on_success: publishOnSuccess,
         publish_remote: publishRemote,
         publish_branch: publishBranch.trim() || null,
@@ -596,19 +603,34 @@ function CreateCampaign() {
           jsxs('section', {
             className: 'rounded-lg border border-(--ui-stroke-tertiary) p-4',
             children: [
-              jsx(SectionHeader, { step: '3', icon: 'shield', title: 'Quality gates', description: 'Require at least one deterministic command and bound the repair loop.' }),
+              jsx(SectionHeader, { step: '3', icon: 'shield', title: 'Quality gates', description: 'Leave both commands empty to start with trusted project discovery.' }),
               jsxs('div', {
                 className: 'mt-4 grid gap-3 md:grid-cols-2',
                 children: [
-                  jsx(Field, { label: 'Build command', hint: 'Optional when a test command is supplied.', children: jsx(Input, { value: buildCommand, onChange: input(setBuildCommand), placeholder: 'npm run build' }) }),
-                  jsx(Field, { label: 'Test command', hint: 'Runs non-interactively after model validation.', children: jsx(Input, { value: testCommand, onChange: input(setTestCommand), placeholder: 'npm test' }) }),
+                  jsx(Field, { label: 'Build command', hint: 'Optional override; leave both gates empty for discovery.', children: jsx(Input, { value: buildCommand, onChange: input(setBuildCommand), placeholder: 'Auto-discover' }) }),
+                  jsx(Field, { label: 'Test command', hint: 'Optional override; discovery selects only trusted candidates.', children: jsx(Input, { value: testCommand, onChange: input(setTestCommand), placeholder: 'Auto-discover' }) }),
                   jsxs('div', {
                     className: 'grid grid-cols-3 gap-3 md:col-span-2',
                     children: [
                       jsx(Field, { label: 'Max rounds', children: jsx(Input, { type: 'number', min: 1, max: 100, value: rounds, onChange: input(setRounds) }) }),
-                      jsx(Field, { label: 'Repairs/change', children: jsx(Input, { type: 'number', min: 0, max: 20, value: repairs, onChange: input(setRepairs) }) }),
+                      jsx(Field, { label: 'Repairs/change', hint: 'Discovery chooses a bounded value when gates are automatic.', children: jsx(Input, { type: 'number', min: 0, max: 20, value: repairs, onChange: input(setRepairs) }) }),
                       jsx(Field, { label: 'Timeout (seconds)', children: jsx(Input, { type: 'number', min: 10, max: 3600, value: gateTimeout, onChange: input(setGateTimeout) }) })
                     ]
+                  }),
+                  jsx(Field, {
+                    label: 'Prompt style',
+                    className: 'md:col-span-2',
+                    hint: 'Simple writes short stage instructions for small local models; Complete keeps the full guidance for cloud models.',
+                    children: jsx(PickerWithContent, {
+                      value: promptProfile,
+                      onChange: setPromptProfile,
+                      items: [
+                        { value: 'complete', label: 'Complete · detailed prompts for cloud models' },
+                        { value: 'simple', label: 'Simple · short prompts for local models' }
+                      ],
+                      placeholder: 'Choose prompt style',
+                      ariaLabel: 'Prompt style'
+                    })
                   }),
                   jsx(Field, { label: 'Target score (0–10)', className: 'md:col-span-2', hint: 'Optional. When set, the loop continues until this average and a final PASS are reached.', children: jsx(Input, { type: 'number', min: 0.1, max: 10, value: targetAverage, onChange: input(setTargetAverage), placeholder: 'Optional; e.g. 9' }) })
                 ]

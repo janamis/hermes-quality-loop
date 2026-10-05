@@ -34,6 +34,7 @@
     test_command: "",
     gate_timeout_seconds: "1800",
     target_average: "",
+    prompt_profile: "complete",
     publish_on_success: false,
     publish_remote: "origin",
     publish_branch: "",
@@ -74,6 +75,23 @@
     );
   }
 
+  function SelectField(props) {
+    return h("div", { className: props.wide ? "space-y-1.5 md:col-span-2" : "space-y-1.5" },
+      h(Label, { htmlFor: props.name, className: "text-sm font-medium" }, props.label),
+      h("select", {
+        id: props.name,
+        name: props.name,
+        value: props.value,
+        onChange: function (event) { props.onChange(props.name, event.target.value); }
+      },
+        props.options.map(function (option) {
+          return h("option", { key: option.value, value: option.value }, option.label);
+        })
+      ),
+      props.help ? h("p", { className: "text-xs text-muted-foreground" }, props.help) : null
+    );
+  }
+
   function statusVariant(state) {
     if (state === "succeeded") return "default";
     if (state === "paused" || state === "stopped") return "secondary";
@@ -108,6 +126,8 @@
           h("dd", null, (campaign.board || "—") + " / " + (campaign.assignee || "—")),
           campaign.target_average != null ? h("dt", { className: "text-muted-foreground" }, "Ranking") : null,
           campaign.target_average != null ? h("dd", null, (campaign.last_average == null ? "not scored" : campaign.last_average + "/10") + " · target " + campaign.target_average + "/10") : null,
+          h("dt", { className: "text-muted-foreground" }, "Prompts"),
+          h("dd", null, campaign.prompt_profile === "simple" ? "simple (local-model wording)" : "complete"),
           active ? h("dt", { className: "text-muted-foreground" }, "Active card") : null,
           active ? h("dd", null, active.title + " (" + active.status + ")") : null
         ),
@@ -177,6 +197,7 @@
       const payload = Object.assign({}, form, {
         gate_timeout_seconds: Number(form.gate_timeout_seconds),
         target_average: form.target_average === "" ? null : Number(form.target_average),
+        prompt_profile: form.prompt_profile === "simple" ? "simple" : "complete",
         publish_on_success: !!form.publish_on_success,
         publish_branch: form.publish_branch.trim() || null,
         provider_override: form.provider_override.trim() || null,
@@ -247,6 +268,17 @@
               h(Field, { name: "validator_model", label: "Validator model", value: form.validator_model, onChange: update, required: true }),
               h(Field, { name: "provider_override", label: "Provider override", value: form.provider_override, onChange: update, placeholder: "Optional, e.g. openai-codex" }),
               h(Field, { name: "target_average", label: "Target average (0–10)", value: form.target_average, onChange: update, type: "number", min: 0.1, max: 10, placeholder: "Optional; e.g. 9" }),
+              h(SelectField, {
+                name: "prompt_profile",
+                label: "Prompt style",
+                value: form.prompt_profile,
+                onChange: update,
+                options: [
+                  { value: "complete", label: "Complete · detailed prompts for cloud models" },
+                  { value: "simple", label: "Simple · short prompts for local models" }
+                ],
+                help: "Simple writes short stage instructions for small local models; Complete keeps full guidance for cloud models."
+              }),
               h(Field, { name: "publish_on_success", label: "Commit and push after final PASS", value: form.publish_on_success, onChange: update, type: "checkbox", help: "Requires a ranking target and a dedicated Git worktree." }),
               h(Field, { name: "publish_remote", label: "Publish remote", value: form.publish_remote, onChange: update }),
               h(Field, { name: "publish_branch", label: "Publish branch", value: form.publish_branch, onChange: update, placeholder: "Current branch when blank" }),
