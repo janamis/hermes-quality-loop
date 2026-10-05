@@ -754,11 +754,14 @@ validation by {validator}. Complete with the typed `examine` quality_loop payloa
             return header + """
 Implement only the selected item in this card. Modify the allowed files, run the exact
 verification commands, then call kanban_complete with the typed `execute` quality_loop payload.
+Do NOT commit, stage, or run any git command that changes history — the controller owns Git.
 If a required change falls outside the allowlist, call kanban_block instead of broadening scope.
 """
         return header + f"""
 Implement the specification or correction in the parent task result.
 Stay within scope, modify the code, add/update tests, and run relevant verification.
+Do not commit, stage, or otherwise change Git history or HEAD — the controller owns the
+repository state and authenticates your exact working-tree delta at completion time.
 If a hidden dependency would require another component, boundary, or file outside the allowlist,
 stop and call kanban_block with the exact dependency instead of broadening the task. After the exact
 verification commands pass, immediately call kanban_complete; do not perform optional cleanup,
@@ -4037,17 +4040,6 @@ def _validation_passed(payload: dict[str, Any], gate_result: dict[str, Any]) -> 
         and int(payload.get("high_issues", 1)) == 0
         and int(payload.get("regressions", 1)) == 0
         and gate_result.get("ok") is True
-    )
-
-
-def _scope_validation_passed(payload: dict[str, Any]) -> bool:
-    return (
-        str(payload.get("verdict", "")).lower() == "pass"
-        and payload.get("one_component") is True
-        and payload.get("one_behavior") is True
-        and payload.get("immediate_boundary") is True
-        and payload.get("commands_resolve") is True
-        and not _string_list(payload.get("hidden_dependencies"))
     )
 
 
