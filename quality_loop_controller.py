@@ -711,7 +711,8 @@ byte-match the trusted contract. The controller, not this worker, persists the s
         )
         if simple:
             return header + f"""
-READ-ONLY: inspect the project. Do not modify files or run installs or the full test suite.
+READ-ONLY: inspect the project by reading files only. Do not modify anything and do not run
+ANY commands — no installs, no tests, no builds, nothing.
 {target_line}
 
 Score these five categories from 0.0 to 10.0:
