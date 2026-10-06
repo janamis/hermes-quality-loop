@@ -2524,6 +2524,19 @@ class QualityLoopControllerTests(unittest.TestCase):
                     self.workspace, "growing.bin", content_limit=1
                 )
 
+    def test_ignored_snapshot_uses_metadata_after_content_hash_budget_is_exhausted(self):
+        (self.workspace / ".gitignore").write_text("large.bin\n", encoding="utf-8")
+        large = self.workspace / "large.bin"
+        large.write_bytes(b"ab")
+
+        with mock.patch.object(controller, "_MAX_IGNORED_HASH_BYTES", 1):
+            first = controller._ignored_snapshot(self.workspace)
+            large.write_bytes(b"abc")
+            second = controller._ignored_snapshot(self.workspace)
+
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(first, second)
+
     def test_ignored_snapshot_charges_growth_at_exact_global_limit(self):
         (self.workspace / ".gitignore").write_text("grow-*.bin\n", encoding="utf-8")
         targets = [self.workspace / "grow-a.bin", self.workspace / "grow-b.bin"]

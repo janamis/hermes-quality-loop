@@ -1873,7 +1873,8 @@ def _ignored_snapshot(root: Path, *, root_fd: Optional[int] = None) -> str:
         relative = _safe_git_relative_path(raw)
         remaining = max(0, _MAX_IGNORED_HASH_BYTES - hashed_bytes)
         entry = _read_workspace_entry(
-            root, relative, content_limit=remaining, root_fd=root_fd
+            root, relative, content_limit=remaining, root_fd=root_fd,
+            metadata_only_if_oversized=True,
         )
         if entry is None:
             raise RuntimeError("ignored workspace changed during snapshot")
@@ -1972,7 +1973,7 @@ def _open_workspace_parent(
 
 def _read_workspace_entry(
     root: Path, path: str, *, content_limit: Optional[int] = None,
-    root_fd: Optional[int] = None,
+    root_fd: Optional[int] = None, metadata_only_if_oversized: bool = False,
 ) -> tuple[str, os.stat_result, bytes] | None:
     """Read one final component from a stable parent fd without following symlinks."""
     for _attempt in range(3):
@@ -2006,6 +2007,8 @@ def _read_workspace_entry(
                 if not stat.S_ISREG(info.st_mode):
                     raise RuntimeError("workspace path is not a regular file or symlink")
                 if content_limit is not None and info.st_size > content_limit:
+                    if metadata_only_if_oversized:
+                        return "file", info, b""
                     raise RuntimeError("workspace file exceeds its bounded read limit")
                 chunks: list[bytes] = []
                 consumed = 0
