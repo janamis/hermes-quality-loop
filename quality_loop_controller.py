@@ -32,10 +32,10 @@ from hermes_constants import get_default_hermes_root
 logger = logging.getLogger(__name__)
 PLUGIN_ID = "quality-loop"
 SCHEMA = "quality-loop/v1"
-CARD_SCHEMA = "quality-loop-card/v2"
+CARD_SCHEMA = "quality-loop-card/v3"
 CARD_ROLES = {
-    "discover", "examine", "scope_validate", "plan", "execute", "validate",
-    "integrate_validate", "final_validate",
+    "discover", "examine", "select_category", "find_defect", "scope_validate",
+    "plan", "execute", "validate", "integrate_validate", "final_validate",
 }
 RANKING_CATEGORIES = (
     "correctness_reliability",
@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
     max_repairs INTEGER NOT NULL DEFAULT 3,
     active_task_id TEXT,
     proposal_task_id TEXT,
+    selected_category TEXT,
     selected_improvement TEXT,
     prompt_profile TEXT NOT NULL DEFAULT 'complete',
     pending_correction TEXT,
@@ -141,6 +142,7 @@ def _conn() -> sqlite3.Connection:
         "last_publish_result": "TEXT",
         "initial_snapshot": "TEXT",
         "authenticated_snapshot": "TEXT",
+        "selected_category": "TEXT",
         "selected_improvement": "TEXT",
         "prompt_profile": "TEXT NOT NULL DEFAULT 'complete'",
         "pending_correction": "TEXT",
@@ -688,7 +690,22 @@ def _task_body(c: dict[str, Any], stage: str) -> str:
         if stage in {"execute", "validate", "integrate_validate", "final_validate"}
         else ""
     )
-    header = f"""QUALITY LOOP CAMPAIGN: {c['id']}
+    if simple:
+        typed = (
+            " The typed top-level `quality_loop` compatibility argument is also accepted."
+            if completion_guidance else ""
+        )
+        header = f"""QUALITY LOOP CAMPAIGN: {c['id']}
+ROUND: {c['round_no']}
+ROLE: {stage.upper()}
+TRUSTED_QUALITY_LOOP_CARD: {marker}
+WORKSPACE: {c['workspace']}
+
+Do only this card's job. Finish with kanban_complete and put the exact payload under
+metadata.quality_loop.{typed} Use kanban_block only when truly blocked.
+"""
+    else:
+        header = f"""QUALITY LOOP CAMPAIGN: {c['id']}
 ROUND: {c['round_no']}
 ROLE: {stage.upper()}
 TRUSTED_QUALITY_LOOP_CARD: {marker}
@@ -701,10 +718,6 @@ human-readable summary. {completion_guidance}Never bury the payload in summary p
 JSON: hardened cards reject unstructured completion and remain in flight for a retry.
 Do not repeat a failing completion call unchanged.
 """
-    if simple:
-        header += (
-            "The stage instructions below are intentionally short. Follow them exactly and stop.\n"
-        )
     if stage == "discover":
         if simple:
             return header + """
@@ -732,69 +745,58 @@ byte-match the trusted contract. The controller, not this worker, persists the s
             f"TARGET AVERAGE: {float(target):g}/10"
             + (f"\nPREVIOUS COMPUTED AVERAGE: {float(last):g}/10" if last is not None else "")
             if target is not None
-            else "No numeric completion target is configured; use candidate_complete only when no critical or high-value defect remains."
+            else "No numeric completion target is configured."
         )
-        validator = str(c.get("validator_model") or "the configured validation model")
-        completion_action = (
-            "After final validation passes, the controller will commit and push the configured branch."
-            if c.get("publish_on_success")
-            else "After final validation passes, the campaign will stop successfully without committing or pushing."
-        )
-        categories = "\n".join(
-            f"   - {name}" for name in RANKING_CATEGORIES
-        )
+        categories = "\n".join(f"- {name}" for name in RANKING_CATEGORIES)
+        score_template = ",".join(f'"{name}":0.0' for name in RANKING_CATEGORIES)
         if simple:
             return header + f"""
-READ-ONLY: inspect the project by reading files only. Do not modify anything and do not run
-ANY commands — no installs, no tests, no builds, nothing.
+READ ONLY. Do not run commands. Score the current code from 0 to 10. Do not find defects.
 {target_line}
-
-Score these five categories from 0.0 to 10.0:
 {categories}
-
-Then pick the ONE highest-priority defect. Return verdict=proposal with one selected_defect
-(title, description, evidence, proposed_outcome). Return verdict=candidate_complete with no
-selected_defect only when nothing important remains. The `metadata.quality_loop` object must use
-schema `quality-loop/v1`, role `examine`, and only these fields: schema, role, verdict,
-score_breakdown, score_rationale, plus selected_defect for a proposal. Do not include any other
-quality_loop fields. {completion_action}
+Payload exactly: {{"schema":"quality-loop/v1","role":"examine","score_breakdown":{{{score_template}}},"score_rationale":"short reason"}}
 """
         return header + f"""
-READ-ONLY EXAMINATION: inspect the CURRENT project without modifying source files or creating logs,
-temporary files, caches, or a .quality-loop directory inside the workspace.
+READ-ONLY RANKING: inspect the current project without modifying files or running commands.
 {target_line}
-
-Do only these four things:
-1. Inspect the project and existing repository evidence.
-2. Score all five categories independently from 0.0 to 10.0:
-   - correctness_reliability: correctness, failure handling, data integrity, concurrency
-   - security_safety: secrets, unsafe operations, input boundaries, privacy
-   - architecture_maintainability: design, coupling, clarity, duplication, evolvability
-   - test_quality: meaningful coverage, regression protection, determinism
-   - user_experience_performance: observable UX, responsiveness, resource use
-3. Identify the single highest-priority defect when meaningful work remains.
-4. Provide concise evidence and a short observable proposed outcome.
-
-Do not scope files, define component boundaries, write implementation instructions, create execution
-slices, or plan the work. Later stages own those responsibilities. Do not run dependency installation
-or the full build or test suite. Prefer repository inspection and existing artifacts; run only a focused,
-read-only check when it is genuinely necessary to substantiate a score.
-
-The controller computes the arithmetic average. Use proposal with exactly one selected_defect when
-work remains; use candidate_complete without a selected_defect only when the project is ready for final
-validation by {validator}. The `metadata.quality_loop` object must use schema `quality-loop/v1`, role
-`examine`, and only these fields: schema, role, verdict, score_breakdown, score_rationale, plus
-selected_defect for a proposal. Do not include any other quality_loop fields.
-{completion_action}
+Score only these categories; do not find, select, or scope defects:
+{categories}
+Return only schema, role, score_breakdown, and a concise score_rationale under metadata.quality_loop.
+"""
+    if stage == "select_category":
+        categories = ", ".join(RANKING_CATEGORIES)
+        if simple:
+            return header + f"""
+READ ONLY. Using TRUSTED_RANKING, choose one category to improve first.
+Allowed category values: {categories}.
+Payload exactly: {{"schema":"quality-loop/v1","role":"select_category","category":"one allowed value","rationale":"short reason"}}
+"""
+        return header + f"""
+READ-ONLY CATEGORY SELECTION. Use the trusted ranking to choose exactly one category whose
+improvement has the highest current value. Do not inspect for a concrete defect yet.
+Allowed values: {categories}.
+Return only schema, role, category, and a concise rationale under metadata.quality_loop.
+"""
+    if stage == "find_defect":
+        if simple:
+            return header + """
+READ ONLY. In TRUSTED_SELECTED_CATEGORY, find one concrete highest-impact defect. Do not scope it.
+Evidence MUST be a JSON array of 1 to 5 unique, non-empty strings.
+Payload exactly: {"schema":"quality-loop/v1","role":"find_defect","verdict":"proposal","selected_defect":{"title":"string","description":"string","evidence":["string"],"proposed_outcome":"string"}}
+Use verdict "candidate_complete" and omit selected_defect only when no important defect exists.
+"""
+        return header + """
+READ-ONLY DEFECT FINDING. Inspect only the trusted selected category and identify one concrete,
+highest-impact defect. Do not choose files, write implementation steps, or scope the repair.
+For proposal, return schema, role, verdict, and selected_defect with exactly title, description,
+evidence (an array of 1 to 5 unique, non-empty strings), and proposed_outcome. Use candidate_complete
+without selected_defect only when no important defect exists in that category.
 """
     if stage == "execute":
         if simple:
             return header + """
-Implement only the selected item in this card. Modify the allowed files, run the exact
-verification commands, then call kanban_complete with the `execute` payload under
-`metadata.quality_loop`.
-Do NOT commit, stage, or run any git command that changes history — the controller owns Git.
-If a required change falls outside the allowlist, call kanban_block instead of broadening scope.
+Implement only SELECTED ITEM. Change only allowed files. Run the exact commands. Do not use git.
+If the change needs another file, call kanban_block. Return the execute payload and stop.
 """
         return header + """
 Implement the specification or correction in the parent task result.
@@ -810,23 +812,20 @@ additional refactoring, file-size analysis, or exploratory work. Put the `execut
     if stage == "scope_validate":
         if simple:
             return header + """
-READ-ONLY: do not modify, create, or delete files.
-Turn the selected defect or repair request into ONE scoped_improvement: one component, one
-behavior, one boundary, short implementation instructions, acceptance criteria, the exact trusted
-verification commands, at most five relevant files, excluded scope, and risks. If it cannot be
-scoped safely, return verdict=fail with a correction_prompt. Do not create execution slices.
-Put the `scope_validate` payload under `metadata.quality_loop`.
+READ ONLY. Turn the input into one bounded improvement: one component, behavior, boundary, and at
+most five files. Copy the exact trusted commands. Return scope_validate with verdict,
+scoped_improvement, and findings. On failure omit scoped_improvement and add correction_prompt.
+Do not plan slices.
 """
         return header + """
 READ-ONLY SCOPE VALIDATION: do not modify, create, delete, stage, commit, reset, or restore files.
 Convert the selected defect or repair request into exactly one component, one observable behavior,
 and one immediate dependency or state boundary. Inspect the real production import, mutable-state,
 lifecycle, database, queue, timer, rendering, and configuration seams before choosing the boundary.
-Produce one scoped_improvement with narrow implementation instructions, acceptance criteria, the exact
-trusted verification commands, no more than five relevant files, explicit excluded scope, and risks.
-Return FAIL with a correction prompt when the finding cannot be scoped safely. Do not decompose the
-work or create execution slices; the planning stage owns that decision. Put the `scope_validate`
-payload under `metadata.quality_loop`.
+Produce one bounded scoped_improvement with narrow instructions, acceptance criteria, the exact
+trusted commands, no more than five relevant files, excluded scope, and risks. Return FAIL with a
+correction prompt when it cannot be scoped safely. Do not create execution slices; the planning
+card will split execution into at-most-two-file slices when required.
 """
     if stage == "plan":
         if simple:
@@ -1064,18 +1063,30 @@ def _normalize_slice(
     }
 
 
-def _selected_defect(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _selected_defect_error(payload: dict[str, Any]) -> Optional[str]:
     raw = payload.get("selected_defect")
-    if not isinstance(raw, dict) or set(raw) != {
-        "title", "description", "evidence", "proposed_outcome"
-    }:
-        return None
+    expected = {"title", "description", "evidence", "proposed_outcome"}
+    if not isinstance(raw, dict):
+        return "selected_defect must be an object"
+    if set(raw) != expected:
+        return "selected_defect must contain exactly title, description, evidence, proposed_outcome"
     for name in ("title", "description", "proposed_outcome"):
         if not isinstance(raw.get(name), str) or not raw[name].strip():
-            return None
+            return f"selected_defect.{name} must be a non-empty string"
     evidence = _strict_string_list(raw.get("evidence"))
-    if evidence is None or len(evidence) > 5:
+    if evidence is None:
+        return "selected_defect.evidence must be a non-empty array of unique strings"
+    if len(evidence) > 5:
+        return "selected_defect.evidence must contain at most five strings"
+    return None
+
+
+def _selected_defect(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if _selected_defect_error(payload) is not None:
         return None
+    raw = payload["selected_defect"]
+    evidence = _strict_string_list(raw["evidence"])
+    assert evidence is not None
     return {
         "title": raw["title"].strip(),
         "description": raw["description"].strip(),
@@ -2562,6 +2573,19 @@ def _execute_item_body(c: dict[str, Any], item: dict[str, Any]) -> str:
         scope_heading = f"SEQUENTIAL SLICE {slice_index + 1} OF {slice_count}"
     else:
         scope_heading = "SELECTED ITEM"
+    if str(c.get("prompt_profile") or "complete") == "simple":
+        return f"""
+{scope_heading}: {item['title']}
+DO: {item['implementation_prompt']}
+ACCEPT:
+{criteria}
+FILES:
+{files}
+COMMANDS:
+{commands}
+EXCLUDE:
+{exclusions}
+"""
     return f"""
 {scope_heading}
 HIGHEST-PRIORITY ITEM: {item['title']}
@@ -2615,16 +2639,19 @@ def _execution_contract_body(
     return f"\nTRUSTED_EXECUTION_CONTRACT: {contract}\n"
 
 
-def _examine_contract_body(c: dict[str, Any]) -> str:
-    contract = json.dumps(
-        {
-            "commands": _campaign_commands(c),
-            "score_required": c.get("target_average") is not None,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return f"\nTRUSTED_EXAMINE_CONTRACT: {contract}\n"
+def _ranking_context_body(c: dict[str, Any]) -> str:
+    ranking = c.get("last_ranking")
+    if not isinstance(ranking, dict) or set(ranking) != set(RANKING_CATEGORIES):
+        raise RuntimeError("category-selection card has no complete trusted ranking")
+    encoded = json.dumps(ranking, sort_keys=True, separators=(",", ":"))
+    return f"\nTRUSTED_RANKING: {encoded}\n"
+
+
+def _selected_category_body(c: dict[str, Any]) -> str:
+    category = c.get("selected_category")
+    if category not in RANKING_CATEGORIES:
+        raise RuntimeError("defect-finding card has no trusted selected category")
+    return f"\nTRUSTED_SELECTED_CATEGORY: {category}\n"
 
 
 def _discovery_contract_body(c: dict[str, Any]) -> str:
@@ -2718,7 +2745,8 @@ def _create_task(
     read_only_snapshot = (
         _execution_git_state(str(c["workspace"]))
         if stage in {
-            "discover", "examine", "scope_validate", "plan", "validate",
+            "discover", "examine", "select_category", "find_defect",
+            "scope_validate", "plan", "validate",
             "integrate_validate", "final_validate",
         }
         else None
@@ -2726,6 +2754,8 @@ def _create_task(
     model_key = {
         "discover": "examiner_model",
         "examine": "examiner_model",
+        "select_category": "examiner_model",
+        "find_defect": "examiner_model",
         "scope_validate": "validator_model",
         "plan": "examiner_model",
         "execute": "executor_model",
@@ -2735,7 +2765,9 @@ def _create_task(
     }[stage]
     label = {
         "discover": "Discover project configuration",
-        "examine": "Examine current codebase and select one defect",
+        "examine": "Rank the five quality categories",
+        "select_category": "Select one category to improve",
+        "find_defect": "Find one defect in the selected category",
         "scope_validate": "Convert selected defect into bounded scope",
         "plan": "Plan bounded execution slices if required",
         "execute": "Execute one bounded implementation slice",
@@ -2778,7 +2810,8 @@ def _create_task(
                 _task_body(c, stage)
                 + (_read_only_snapshot_body(read_only_snapshot) if read_only_snapshot else "")
                 + (_discovery_contract_body(c) if stage == "discover" else "")
-                + (_examine_contract_body(c) if stage == "examine" else "")
+                + (_ranking_context_body(c) if stage == "select_category" else "")
+                + (_selected_category_body(c) if stage == "find_defect" else "")
                 + (_scope_input_body(c, improvement, correction) if stage == "scope_validate" and improvement else "")
                 + (_planning_item_body(c, improvement) if stage == "plan" and improvement else "")
                 + (
@@ -2798,7 +2831,9 @@ def _create_task(
             priority=10,
             parents=parents,
             idempotency_key=key,
-            max_runtime_seconds=1200 if stage == "examine" else 7200,
+            max_runtime_seconds=(
+                1200 if stage in {"examine", "select_category", "find_defect"} else 7200
+            ),
             skills=[],
             max_retries=1 if stage == "execute" else 2,
             model_override=c[model_key],
@@ -2820,7 +2855,9 @@ def _summary_fallback_handoff(run: Any, expected_role: str | None) -> Optional[d
         return None
     normalized = re.sub(r"\s+", " ", summary.lower())
 
-    if expected_role in {"examine", "scope_validate", "plan"}:
+    if expected_role in {
+        "examine", "select_category", "find_defect", "scope_validate", "plan"
+    }:
         return None
 
     if expected_role == "validate":
@@ -3108,9 +3145,10 @@ def _quality_payload_error(
             "build_command", "test_command", "max_repairs", "runtime_evidence",
         },
         "examine": {
-            "schema", "role", "verdict", "score_breakdown", "score_rationale",
-            "selected_defect",
+            "schema", "role", "score_breakdown", "score_rationale",
         },
+        "select_category": {"schema", "role", "category", "rationale"},
+        "find_defect": {"schema", "role", "verdict", "selected_defect"},
         "scope_validate": {
             "schema", "role", "verdict", "scoped_improvement", "findings",
             "correction_prompt",
@@ -3128,8 +3166,10 @@ def _quality_payload_error(
     required = {
         "discover": allowed,
         "examine": {
-            "schema", "role", "verdict", "score_breakdown", "score_rationale",
+            "schema", "role", "score_breakdown", "score_rationale",
         },
+        "select_category": allowed,
+        "find_defect": {"schema", "role", "verdict"},
         "scope_validate": {"schema", "role", "verdict", "findings"},
         "plan": {"schema", "role", "decomposition_required", "rationale"},
         "execute": allowed,
@@ -3167,17 +3207,25 @@ def _quality_payload_error(
             return "discovery max_repairs is not a trusted bounded candidate"
         return None
     if role == "examine":
-        verdict = payload.get("verdict")
-        if verdict not in {"proposal", "candidate_complete"}:
-            return "examiner verdict must be proposal or candidate_complete"
         average, _ranking, error = _ranking_average(payload)
         if error or average is None:
             return error or "invalid score_breakdown"
         if not isinstance(payload.get("score_rationale"), str) or not payload["score_rationale"].strip():
             return "score_rationale must be non-empty"
-        if verdict == "proposal" and _selected_defect(payload) is None:
-            return "proposal requires exactly one valid selected_defect"
-        if verdict == "candidate_complete" and "selected_defect" in payload:
+        return None
+    if role == "select_category":
+        if payload.get("category") not in RANKING_CATEGORIES:
+            return "category must be one of the five ranking categories"
+        if not isinstance(payload.get("rationale"), str) or not payload["rationale"].strip():
+            return "rationale must be non-empty"
+        return None
+    if role == "find_defect":
+        verdict = payload.get("verdict")
+        if verdict not in {"proposal", "candidate_complete"}:
+            return "defect verdict must be proposal or candidate_complete"
+        if verdict == "proposal":
+            return _selected_defect_error(payload)
+        if "selected_defect" in payload:
             return "candidate_complete cannot include selected_defect"
         return None
     if role == "scope_validate":
@@ -4122,6 +4170,7 @@ def _queue_next_examination(c: dict[str, Any], parent_id: str, run_id: int | Non
         stage="examine",
         active_task_id=task_id,
         proposal_task_id=None,
+        selected_category=None,
         selected_improvement=None,
         slice_index=0,
         slice_count=0,
@@ -4173,7 +4222,8 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
             )
             return get_campaign(campaign_id)
         if stage in {
-            "discover", "examine", "scope_validate", "plan", "validate",
+            "discover", "examine", "select_category", "find_defect",
+            "scope_validate", "plan", "validate",
             "integrate_validate", "final_validate",
         } and not _read_only_snapshot_unchanged(c, str(task.body or "")):
             _pause(
@@ -4231,7 +4281,6 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
             return get_campaign(campaign_id)
 
         if stage == "examine":
-            verdict = str((payload or {}).get("verdict", "")).lower()
             average, ranking, ranking_error = _ranking_average(payload or {})
             if ranking_error or average is None:
                 _pause(
@@ -4258,33 +4307,58 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                         f"{float(target_average):g}/10; final validation ready"
                     ),
                 )
-            elif verdict == "candidate_complete":
-                if target_average is not None:
+            else:
+                c["last_average"] = average
+                c["last_ranking"] = ranking
+                task_id = _create_task(c, "select_category", [task.id])
+                _update(
+                    campaign_id,
+                    stage="select_category", active_task_id=task_id, proposal_task_id=task.id,
+                    processed_run_id=run.id if run else None, final_mode=0,
+                    selected_category=None,
+                    selected_improvement=None, slice_index=0, slice_count=0, repair_no=0,
+                    last_average=average, last_ranking=json.dumps(ranking, sort_keys=True),
+                    message=(
+                        f"Ranking average is {average:g}/10; category selection ready"
+                    ),
+                )
+
+        elif stage == "select_category":
+            category = str(payload.get("category") or "")
+            selected = dict(c, selected_category=category)
+            task_id = _create_task(selected, "find_defect", [task.id])
+            _update(
+                campaign_id,
+                stage="find_defect", active_task_id=task_id,
+                processed_run_id=run.id if run else None,
+                selected_category=category,
+                message=f"Selected {category}; defect-finding card ready",
+            )
+
+        elif stage == "find_defect":
+            verdict = str(payload.get("verdict") or "").lower()
+            if verdict == "candidate_complete":
+                if c.get("target_average") is not None:
                     _pause(
                         c,
-                        f"Examiner declared candidate_complete at average {average:g}/10, below target "
-                        f"{float(target_average):g}/10",
+                        "No defect was found in the selected category while the ranking remains below target",
                         run_id=run.id if run else None,
                     )
-                else:
-                    c["proposal_task_id"] = task.id
-                    c["final_mode"] = True
-                    c["last_average"] = average
-                    c["last_ranking"] = ranking
-                    task_id = _create_task(c, "final_validate", [task.id])
-                    _update(
-                        campaign_id,
-                        stage="final_validate", active_task_id=task_id, proposal_task_id=task.id,
-                        processed_run_id=run.id if run else None, final_mode=1,
-                        last_average=average, last_ranking=json.dumps(ranking, sort_keys=True),
-                        message="Examiner reports candidate complete; final audit ready",
-                    )
+                    return get_campaign(campaign_id)
+                c["final_mode"] = True
+                task_id = _create_task(c, "final_validate", [task.id])
+                _update(
+                    campaign_id,
+                    stage="final_validate", active_task_id=task_id, proposal_task_id=task.id,
+                    processed_run_id=run.id if run else None, final_mode=1,
+                    message="No important defect found; final audit ready",
+                )
             else:
-                defect = _selected_defect(payload or {})
-                if verdict != "proposal" or defect is None:
+                defect = _selected_defect(payload)
+                if defect is None:
                     _pause(
                         c,
-                        "Examiner did not return one valid selected_defect",
+                        "Defect finder did not return one valid selected_defect",
                         run_id=run.id if run else None,
                     )
                     return get_campaign(campaign_id)
@@ -4294,11 +4368,7 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                     stage="scope_validate", active_task_id=task_id, proposal_task_id=task.id,
                     processed_run_id=run.id if run else None, final_mode=0,
                     selected_improvement=None, slice_index=0, slice_count=0, repair_no=0,
-                    last_average=average, last_ranking=json.dumps(ranking, sort_keys=True),
-                    message=(
-                        f"Examiner selected one defect at average {average:g}/10; "
-                        "scope validation ready"
-                    ),
+                    message="One defect selected; atomic scope validation ready",
                 )
 
         elif stage == "scope_validate":
@@ -4417,7 +4487,7 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                     stage="plan", active_task_id=task_id,
                     processed_run_id=run.id if run else None,
                     selected_improvement=json.dumps(improvement, sort_keys=True),
-                    message="Scope validation produced one bounded improvement; planning ready",
+                    message="Atomic scope passed; decomposition decision ready",
                 )
 
         elif stage == "plan":

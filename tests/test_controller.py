@@ -149,9 +149,10 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertIsNotNone(task)
         assert task is not None
         body = task.body or ""
-        self.assertIn("single highest-priority defect", body)
-        self.assertIn("Do not run dependency installation", body)
-        self.assertIn("or the full build or test suite", body)
+        self.assertIn("READ-ONLY RANKING", body)
+        self.assertIn("Score only these categories", body)
+        self.assertIn("do not find, select, or scope defects", body)
+        self.assertNotIn("selected_defect", body)
         self.assertNotIn("improvement_items", body)
         self.assertNotIn("execution_slices", body)
         self.assertNotIn("Set `kanban_complete.quality_loop` to exactly:", body)
@@ -164,12 +165,16 @@ class QualityLoopControllerTests(unittest.TestCase):
         campaign = self.create_campaign()
         self.assertEqual(campaign["prompt_profile"], "complete")
         body = controller._task_body(campaign, "examine")
-        self.assertIn("The controller computes the arithmetic average", body)
+        self.assertIn("READ-ONLY RANKING", body)
+        self.assertIn("Return only schema, role, score_breakdown", body)
 
     def test_simple_prompt_profile_keeps_short_local_model_prompts(self):
         campaign = self.create_campaign(prompt_profile="simple")
         self.assertEqual(campaign["prompt_profile"], "simple")
-        for stage in ("examine", "scope_validate", "plan", "execute", "validate"):
+        for stage in (
+            "examine", "select_category", "find_defect", "scope_validate",
+            "plan", "execute", "validate",
+        ):
             body = controller._task_body(campaign, stage)
             # The machine-parsed trusted markers must survive the short profile.
             self.assertIn("TRUSTED_QUALITY_LOOP_CARD", body, stage)
@@ -178,24 +183,24 @@ class QualityLoopControllerTests(unittest.TestCase):
             else:
                 self.assertNotIn("typed top-level `quality_loop` compatibility argument", body, stage)
             self.assertNotIn("QUALITY_LOOP_JSON: ", body, stage)
-            # Local-model guidance stays short: no multi-paragraph exclusion essays.
-            self.assertLess(len(body), 2200, f"{stage} prompt too long for local models")
+            # Local-model guidance is one small job, not a compressed essay.
+            self.assertLess(len(body), 1300, f"{stage} prompt too long for local models")
             self.assertNotIn("Do only these four things", body, stage)
             self.assertNotIn("READ-ONLY EXAMINATION: inspect the CURRENT project", body, stage)
 
-    def test_simple_profile_examine_prompt_names_exact_handoff_fields_and_categories(self):
+    def test_simple_profile_ranks_before_any_defect_work(self):
         campaign = self.create_campaign(prompt_profile="simple")
         body = controller._task_body(campaign, "examine")
         for category in controller.RANKING_CATEGORIES:
             self.assertIn(category, body)
-        self.assertIn("one", body.lower())
-        self.assertIn("defect", body.lower())
+        self.assertNotIn("selected_defect", body)
+        self.assertNotIn("pick", body.lower())
         normalized = " ".join(body.split())
         self.assertIn(
-            "schema, role, verdict, score_breakdown, score_rationale",
+            '"schema":"quality-loop/v1","role":"examine","score_breakdown"',
             normalized,
         )
-        self.assertIn("Do not include any other quality_loop fields", normalized)
+        self.assertIn("Do not find defects", normalized)
 
     def test_prompt_profile_rejects_unknown_values(self):
         with self.assertRaisesRegex(ValueError, "prompt_profile"):
@@ -260,18 +265,41 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertIn("TARGET AVERAGE: 9/10", body)
         self.assertIn("PREVIOUS COMPUTED AVERAGE: 7.5/10", body)
 
-    def test_proposal_moves_through_scope_and_plan_before_execute(self):
-        campaign = self.create_campaign()
+    def test_ranking_then_category_then_defect_then_scope_then_execute(self):
+        campaign = self.create_campaign(prompt_profile="simple")
         campaign = self.complete(
             campaign,
             {
                 "schema": controller.SCHEMA,
                 "role": "examine",
-                "verdict": "proposal",
                 "score_breakdown": {
                     name: 7.0 for name in controller.RANKING_CATEGORIES
                 },
                 "score_rationale": "One boundary defect dominates the current score.",
+            },
+            auto_scope=False,
+        )
+        self.assertEqual(campaign["stage"], "select_category")
+
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "select_category",
+                "category": "correctness_reliability",
+                "rationale": "It has the highest-value actionable gap.",
+            },
+            auto_scope=False,
+        )
+        self.assertEqual(campaign["stage"], "find_defect")
+        self.assertEqual(campaign["selected_category"], "correctness_reliability")
+
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "find_defect",
+                "verdict": "proposal",
                 "selected_defect": {
                     "title": "Return the tested value",
                     "description": "The application seam returns the wrong value.",
@@ -307,14 +335,13 @@ class QualityLoopControllerTests(unittest.TestCase):
             auto_scope=False,
         )
         self.assertEqual(campaign["stage"], "plan")
-
         campaign = self.complete(
             campaign,
             {
                 "schema": controller.SCHEMA,
                 "role": "plan",
                 "decomposition_required": False,
-                "rationale": "The item already changes one component and one boundary.",
+                "rationale": "The item is already one component and one boundary.",
             },
             auto_scope=False,
         )
@@ -432,7 +459,7 @@ class QualityLoopControllerTests(unittest.TestCase):
 
                 resumed = controller.set_campaign_state(c["id"], "resume")
                 self.assertEqual(resumed["state"], "running")
-                self.assertEqual(resumed["stage"], "scope_validate")
+                self.assertEqual(resumed["stage"], "select_category")
                 first_child = resumed["active_task_id"]
                 conn = kbc.connect(board=c["board"])
                 try:
@@ -489,10 +516,33 @@ class QualityLoopControllerTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def _advance_to_find_defect(self, payload):
+        campaign = self.create_campaign()
+        campaign = self.complete(campaign, self.proposal(), auto_scope=False)
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "select_category",
+                "category": "correctness_reliability",
+                "rationale": "Deterministic defect-contract test category.",
+            },
+            auto_scope=False,
+        )
+        self.assertEqual(campaign["stage"], "find_defect")
+        return self.complete(campaign, payload, auto_scope=False)
+
     def test_direct_completion_rejects_unknown_improvement_item_key_without_child(self):
-        payload = self.proposal()
+        self.proposal()
+        payload = {
+            "schema": controller.SCHEMA,
+            "role": "find_defect",
+            "verdict": "proposal",
+            "selected_defect": dict(self._auto_selected_defect),
+        }
         payload["selected_defect"]["unknown_item_key"] = "forbidden"
-        self._assert_direct_examine_rejected(payload)
+        result = self._advance_to_find_defect(payload)
+        self.assertEqual(result["state"], "needs_review")
 
     def test_direct_completion_rejects_unknown_execution_slice_key_without_child(self):
         payload = self.proposal()
@@ -500,14 +550,28 @@ class QualityLoopControllerTests(unittest.TestCase):
         self._assert_direct_examine_rejected(payload)
 
     def test_direct_completion_rejects_nested_execution_slices_without_child(self):
-        payload = self.proposal()
+        self.proposal()
+        payload = {
+            "schema": controller.SCHEMA,
+            "role": "find_defect",
+            "verdict": "proposal",
+            "selected_defect": dict(self._auto_selected_defect),
+        }
         payload["selected_defect"]["execution_slices"] = []
-        self._assert_direct_examine_rejected(payload)
+        result = self._advance_to_find_defect(payload)
+        self.assertEqual(result["state"], "needs_review")
 
     def test_direct_completion_rejects_execution_slice_priority_without_child(self):
-        payload = self.proposal()
+        self.proposal()
+        payload = {
+            "schema": controller.SCHEMA,
+            "role": "find_defect",
+            "verdict": "proposal",
+            "selected_defect": dict(self._auto_selected_defect),
+        }
         payload["selected_defect"]["priority"] = 1
-        self._assert_direct_examine_rejected(payload)
+        result = self._advance_to_find_defect(payload)
+        self.assertEqual(result["state"], "needs_review")
 
     def test_direct_completion_rejects_boolean_score_without_child(self):
         payload = self.proposal(scores=7.5)
@@ -585,8 +649,9 @@ class QualityLoopControllerTests(unittest.TestCase):
             self.assertIsNotNone(examine)
             assert examine is not None
             self.assertEqual(kb.parent_ids(conn, examine.id), [discovery.id])
-            self.assertIn(payload["build_command"], examine.body or "")
-            self.assertIn(payload["test_command"], examine.body or "")
+            self.assertNotIn(payload["build_command"], examine.body or "")
+            self.assertNotIn(payload["test_command"], examine.body or "")
+            self.assertIn("Score only these categories", examine.body or "")
         finally:
             conn.close()
 
@@ -720,6 +785,31 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertEqual(persisted["max_repairs"], 1)
         self.assertIsNone(persisted["processed_run_id"])
 
+    def advance_to_scope_validate(self, campaign, ranking):
+        campaign = self.complete(campaign, ranking, auto_scope=False)
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "select_category",
+                "category": "correctness_reliability",
+                "rationale": "Deterministic category for scope tests.",
+            },
+            auto_scope=False,
+        )
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "find_defect",
+                "verdict": "proposal",
+                "selected_defect": self._auto_selected_defect,
+            },
+            auto_scope=False,
+        )
+        self.assertEqual(campaign["stage"], "scope_validate")
+        return campaign
+
     def test_unsliced_improvement_over_two_files_is_rejected(self):
         scoped = self.scoped_item(
             "Three-file change",
@@ -728,7 +818,7 @@ class QualityLoopControllerTests(unittest.TestCase):
         )
         scoped["relevant_files"] = ["app.py", "server.js", "package.json"]
         campaign = self.create_campaign()
-        campaign = self.complete(campaign, self.proposal(item=scoped), auto_scope=False)
+        campaign = self.advance_to_scope_validate(campaign, self.proposal(item=scoped))
         campaign = self.complete(
             campaign,
             {
@@ -758,7 +848,7 @@ class QualityLoopControllerTests(unittest.TestCase):
         parent = dict(self._auto_scoped_item)
         parent["relevant_files"] = [*parent["relevant_files"], "app.py"]
         campaign = self.create_campaign()
-        campaign = self.complete(campaign, payload, auto_scope=False)
+        campaign = self.advance_to_scope_validate(campaign, payload)
         campaign = self.complete(
             campaign,
             {
@@ -824,6 +914,36 @@ class QualityLoopControllerTests(unittest.TestCase):
         finally:
             conn.close()
         result = controller.reconcile_campaign(campaign["id"])
+        if auto_scope and result["state"] == "running" and result["stage"] == "select_category":
+            scores = result.get("last_ranking") or {}
+            category = min(
+                controller.RANKING_CATEGORIES,
+                key=lambda name: float(scores.get(name, 10.0)),
+            )
+            result = self.complete(
+                result,
+                {
+                    "schema": controller.SCHEMA,
+                    "role": "select_category",
+                    "category": category,
+                    "rationale": "Lowest current score in the deterministic test ranking.",
+                },
+                auto_scope=False,
+            )
+        if auto_scope and result["state"] == "running" and result["stage"] == "find_defect":
+            defect = getattr(self, "_auto_selected_defect", None)
+            if defect is None:
+                raise AssertionError("test proposal has no selected defect fixture")
+            result = self.complete(
+                result,
+                {
+                    "schema": controller.SCHEMA,
+                    "role": "find_defect",
+                    "verdict": "proposal",
+                    "selected_defect": defect,
+                },
+                auto_scope=False,
+            )
         if auto_scope and result["state"] == "running" and result["stage"] == "scope_validate":
             if int(result.get("repair_no") or 0):
                 # Repairs route back through scope_validate against the active slice.
@@ -897,18 +1017,17 @@ class QualityLoopControllerTests(unittest.TestCase):
             scores = 7.5
         if isinstance(scores, (int, float)):
             scores = {name: float(scores) for name in controller.RANKING_CATEGORIES}
+        self._auto_selected_defect = {
+            "title": scoped["title"],
+            "description": scoped["implementation_prompt"],
+            "evidence": [f"{scoped['relevant_files'][0]} demonstrates the defect"],
+            "proposed_outcome": scoped["behavior"],
+        }
         return {
             "schema": controller.SCHEMA,
             "role": "examine",
-            "verdict": "proposal",
             "score_breakdown": scores,
             "score_rationale": "Deterministic test scores",
-            "selected_defect": {
-                "title": scoped["title"],
-                "description": scoped["implementation_prompt"],
-                "evidence": [f"{scoped['relevant_files'][0]} demonstrates the defect"],
-                "proposed_outcome": scoped["behavior"],
-            },
         }
 
     def scoped_item(
@@ -1066,22 +1185,41 @@ class QualityLoopControllerTests(unittest.TestCase):
             {
                 "schema": controller.SCHEMA,
                 "role": "examine",
-                "verdict": "candidate_complete",
                 "score_breakdown": {
                     name: 10.0 for name in controller.RANKING_CATEGORIES
                 },
                 "score_rationale": "No critical or high-value defect remains.",
             },
+            auto_scope=False,
+        )
+        c = self.complete(
+            c,
+            {
+                "schema": controller.SCHEMA,
+                "role": "select_category",
+                "category": "correctness_reliability",
+                "rationale": "Check the lowest-risk category before declaring completion.",
+            },
+            auto_scope=False,
+        )
+        c = self.complete(
+            c,
+            {
+                "schema": controller.SCHEMA,
+                "role": "find_defect",
+                "verdict": "candidate_complete",
+            },
+            auto_scope=False,
         )
         self.assertEqual(c["stage"], "final_validate")
         self.assertTrue(c["final_mode"])
         c = self.complete(c, self.passing_validation())
         self.assertEqual(c["state"], "succeeded")
 
-    def test_ranked_local_campaign_prompt_names_configured_validator_without_publish(self):
+    def test_ranked_prompt_omits_unrelated_validator_and_publication_details(self):
         c = self.create_campaign(target_average=9.0, publish_on_success=False)
         body = controller._task_body(c, "examine")
-        self.assertIn("example-validator", body)
+        self.assertNotIn("example-validator", body)
         self.assertNotIn("Sol", body)
         self.assertNotIn("commits and pushes", body)
 
@@ -1097,8 +1235,9 @@ class QualityLoopControllerTests(unittest.TestCase):
     def test_examiner_returns_prioritized_items_and_execute_card_uses_only_first(self):
         c = self.create_campaign(target_average=9.0)
         examine_body = controller._task_body(c, "examine")
-        # The narrow examiner selects exactly one defect; no multi-item lists in the prompt.
-        self.assertIn("single highest-priority defect", examine_body)
+        # Ranking is its own card and must not include defect selection or planning.
+        self.assertIn("do not find, select, or scope defects", examine_body)
+        self.assertNotIn("selected_defect", examine_body)
         self.assertNotIn("improvement_items", examine_body)
         self.assertNotIn("execution_slices", examine_body)
 
@@ -1195,14 +1334,24 @@ class QualityLoopControllerTests(unittest.TestCase):
             first_scope_parents = board.execute(
                 "SELECT parent_id FROM task_links WHERE child_id = ?", (first_scope_id,)
             ).fetchall()
+            find_defect_id = first_scope_parents[0]["parent_id"]
+            find_defect_parents = board.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (find_defect_id,)
+            ).fetchall()
+            select_category_id = find_defect_parents[0]["parent_id"]
+            select_category_parents = board.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (select_category_id,)
+            ).fetchall()
         finally:
             board.close()
         self.assertEqual(len(first_parents), 1)
-        # examiner → scope_validate → plan → execute.
+        # ranking → category → defect → scope_validate → plan → execute.
         self.assertEqual(len(first_planner_parents), 1)
         self.assertIn("TRUSTED_PLAN_CONTRACT", first_planner.body)
+        self.assertEqual(len(first_scope_parents), 1)
+        self.assertEqual(len(find_defect_parents), 1)
         self.assertEqual(
-            [row["parent_id"] for row in first_scope_parents], [examiner_id]
+            [row["parent_id"] for row in select_category_parents], [examiner_id]
         )
         self.assertIn("SEQUENTIAL SLICE 1 OF 3", first_executor.body)
         self.assertNotIn("Use production functions in tests", first_executor.body)
@@ -1343,10 +1492,29 @@ class QualityLoopControllerTests(unittest.TestCase):
             {
                 "schema": controller.SCHEMA,
                 "role": "examine",
-                "verdict": "candidate_complete",
                 "score_breakdown": {name: 8.5 for name in controller.RANKING_CATEGORIES},
                 "score_rationale": "Every category remains below the configured target.",
             },
+            auto_scope=False,
+        )
+        c = self.complete(
+            c,
+            {
+                "schema": controller.SCHEMA,
+                "role": "select_category",
+                "category": "correctness_reliability",
+                "rationale": "This category remains below target.",
+            },
+            auto_scope=False,
+        )
+        c = self.complete(
+            c,
+            {
+                "schema": controller.SCHEMA,
+                "role": "find_defect",
+                "verdict": "candidate_complete",
+            },
+            auto_scope=False,
         )
         self.assertEqual(c["state"], "needs_review")
         self.assertIn("below target", c["message"].lower())
@@ -2881,7 +3049,10 @@ class QualityLoopControllerTests(unittest.TestCase):
 
     def test_task_body_requires_namespaced_metadata_or_typed_compatibility_input(self):
         c = self.create_campaign()
-        for stage in ("examine", "scope_validate", "plan", "execute", "validate", "final_validate"):
+        for stage in (
+            "examine", "select_category", "find_defect", "scope_validate",
+            "plan", "execute", "validate", "final_validate",
+        ):
             body = controller._task_body(c, stage)
             self.assertIn("metadata.quality_loop", body, stage)
             if stage in {"execute", "validate", "final_validate"}:
@@ -3119,18 +3290,28 @@ class QualityLoopControllerTests(unittest.TestCase):
 
     def test_every_read_only_stage_embeds_and_enforces_full_workspace_snapshot(self):
         campaign = self.create_campaign()
+        campaign = dict(
+            campaign,
+            last_ranking={name: 7.0 for name in controller.RANKING_CATEGORIES},
+            selected_category="correctness_reliability",
+        )
         improvement = self.scoped_item(
             "Read-only snapshot", "Validate without mutation.", "workspace stays unchanged"
         )
         for stage in (
-            "examine", "scope_validate", "validate", "integrate_validate", "final_validate"
+            "examine", "select_category", "find_defect", "scope_validate",
+            "validate", "integrate_validate", "final_validate",
         ):
             with self.subTest(stage=stage):
                 task_id = controller._create_task(
                     campaign,
                     stage,
                     [],
-                    improvement=improvement if stage != "examine" else None,
+                    improvement=(
+                        improvement
+                        if stage not in {"examine", "select_category", "find_defect"}
+                        else None
+                    ),
                     integration_validation=stage == "integrate_validate",
                 )
                 conn = kbc.connect(board=campaign["board"])
@@ -3327,6 +3508,67 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertEqual(result["state"], "needs_review")
         self.assertIn("snapshots disagree", result["message"])
 
+    def test_find_defect_scalar_evidence_is_contained_with_precise_error(self):
+        from tools import kanban_tools as kt
+
+        campaign = self.create_campaign()
+        campaign = self.complete(campaign, self.proposal(), auto_scope=False)
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "select_category",
+                "category": "test_quality",
+                "rationale": "Exercise the defect handoff boundary.",
+            },
+            auto_scope=False,
+        )
+        task_id = campaign["active_task_id"]
+        conn = kbc.connect(board=campaign["board"])
+        try:
+            self.assertTrue(kb.claim_task(conn, task_id))
+            claimed = kb.get_task(conn, task_id)
+            self.assertIsNotNone(claimed)
+            assert claimed is not None
+            run_id = claimed.current_run_id
+        finally:
+            conn.close()
+        os.environ["HERMES_KANBAN_TASK"] = task_id
+        os.environ["HERMES_KANBAN_RUN_ID"] = str(run_id)
+        invalid = {
+            "schema": controller.SCHEMA,
+            "role": "find_defect",
+            "verdict": "proposal",
+            "selected_defect": {
+                "title": "Missing coverage",
+                "description": "The target behavior lacks a regression test.",
+                "evidence": "app.py has no matching test",
+                "proposed_outcome": "Add one focused regression test.",
+            },
+        }
+        outcome = json.loads(
+            kt._handle_complete(
+                {
+                    "summary": "Found one defect.",
+                    "metadata": {"quality_loop": invalid},
+                }
+            )
+        )
+        self.assertTrue(outcome.get("ok"), outcome)
+        result = controller.reconcile_campaign(campaign["id"])
+        self.assertEqual(result["state"], "needs_review")
+        self.assertIn(
+            "selected_defect.evidence must be a non-empty array of unique strings",
+            result.get("message", ""),
+        )
+        conn = kbc.connect(board=campaign["board"])
+        try:
+            task = kb.get_task(conn, task_id)
+        finally:
+            conn.close()
+        assert task is not None
+        self.assertEqual(task.status, "done")
+
     def test_real_completion_boundary_advances_scope_execute_validate_lineage(self):
         from tools import kanban_tools as kt
 
@@ -3357,6 +3599,26 @@ class QualityLoopControllerTests(unittest.TestCase):
             return controller.reconcile_campaign(current["id"])
 
         campaign = complete_through_tool(campaign, self.proposal())
+        self.assertEqual(campaign["stage"], "select_category")
+        campaign = complete_through_tool(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "select_category",
+                "category": "correctness_reliability",
+                "rationale": "This category has the clearest test defect.",
+            },
+        )
+        self.assertEqual(campaign["stage"], "find_defect")
+        campaign = complete_through_tool(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "find_defect",
+                "verdict": "proposal",
+                "selected_defect": self._auto_selected_defect,
+            },
+        )
         self.assertEqual(campaign["stage"], "scope_validate")
         scoped = self.scoped_item(
             "Tested application change",

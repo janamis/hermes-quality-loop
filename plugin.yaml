@@ -1,8 +1,8 @@
 name: quality-loop
-version: 0.3.1
+version: 0.3.2
 manifest_version: 2
 api_version: 1
-description: "Durable Kanban loop: examine a codebase, execute the proposed prompt, validate, repair, and repeat until final acceptance."
+description: "Durable Kanban loop: rank, select one category and defect, scope, execute, validate, repair, and repeat."
 author: "janamis"
 license: MIT
 homepage: https://github.com/janamis/hermes-quality-loop

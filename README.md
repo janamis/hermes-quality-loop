@@ -4,23 +4,26 @@ Quality Loop is a Hermes Agent plugin for durable code-quality campaigns on the 
 
 ## Workflow
 
-1. **Examine** the current codebase with the configured examination model.
-2. Select exactly one highest-priority improvement. Prefer one focused executor card; when a safe
-   implementation requires dependent steps, the examiner may define 2–5 ordered atomic slices.
-3. **Execute one slice at a time** with the coding model. Only the current slice becomes ready.
-4. **Validate every slice independently** with the validation model. The next executor depends on the
+1. **Rank** the five quality categories without finding or scoping defects.
+2. **Select one category** from that ranking.
+3. **Find one defect** in the selected category. This card returns evidence as a non-empty JSON array
+   and does not choose files or implementation steps.
+4. **Scope** that one defect, then use a separate planning card to keep each executor atomic. A plan
+   may define 2–5 ordered slices when one safe change cannot fit in a single executor.
+5. **Execute one slice at a time** with the coding model. Only the current slice becomes ready.
+6. **Validate every slice independently** with the validation model. The next executor depends on the
    preceding validator, so a later slice cannot start before the earlier slice passes.
-5. On focused validation failure, create a bounded repair for that same slice and revalidate it.
-6. After all slices pass, run one read-only **integrated validation** across the complete selected
+7. On focused validation failure, create a bounded repair for that same slice and revalidate it.
+8. After all slices pass, run one read-only **integrated validation** across the complete selected
    improvement. An integration failure creates a scoped repair that preserves validated slices.
-7. Only after integrated validation passes, start a fresh examination and ranking round.
-8. When the examiner returns `candidate_complete`, require a final whole-codebase validation.
-9. Finish only when the final validator passes **and** the configured build/test commands return exit code 0.
+9. Only after integrated validation passes, start a fresh ranking round.
+10. When defect finding returns `candidate_complete`, require a final whole-codebase validation.
+11. Finish only when the final validator passes **and** the configured build/test commands return exit code 0.
 
-Legacy single-item examiner handoffs continue to run as one focused executor/validator pair before
-fresh examination. The controller persists the selected improvement and slice position so gateway
-restarts preserve ordering. Card idempotency includes parent lineage and slice scope, preventing a
-retry from reusing a stale task from a different slice.
+The controller persists the selected category, improvement, and slice position so gateway restarts
+preserve ordering. Card idempotency includes parent lineage and slice scope, preventing a retry from
+reusing a stale task from a different slice. The split workflow uses card schema v3; older in-flight
+cards fail closed and require a fresh controller-owned ranking card instead of being reinterpreted.
 
 The controller registers `on_kanban_dispatch_tick` and never calls an LLM itself.
 
@@ -82,8 +85,9 @@ Quality Loop never merges or deploys changes.
 
 Workers complete cards with `metadata.quality_loop.schema = "quality-loop/v1"`. Quality Loop checks
 for the controller-owned Kanban task capability before persisting a campaign, so an incompatible
-Hermes installation fails clearly without leaving a running campaign row. Missing or malformed
-examination or validation metadata pauses the campaign as `needs_review` instead of guessing.
+Hermes installation fails clearly without leaving a running campaign row. Missing or malformed stage metadata pauses the campaign as `needs_review` instead of guessing. The
+controller reports the first precise contract error, including whether defect evidence is not a
+non-empty array of unique strings.
 
 ## Verification
 
