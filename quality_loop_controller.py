@@ -767,13 +767,13 @@ Return only schema, role, score_breakdown, and a concise score_rationale under m
         categories = ", ".join(RANKING_CATEGORIES)
         if simple:
             return header + f"""
-READ ONLY. Using TRUSTED_RANKING, choose one category to improve first.
+READ ONLY. Choose one category tied for the lowest score in TRUSTED_RANKING.
 Allowed category values: {categories}.
 Payload exactly: {{"schema":"quality-loop/v1","role":"select_category","category":"one allowed value","rationale":"short reason"}}
 """
         return header + f"""
-READ-ONLY CATEGORY SELECTION. Use the trusted ranking to choose exactly one category whose
-improvement has the highest current value. Do not inspect for a concrete defect yet.
+READ-ONLY CATEGORY SELECTION. Use the trusted ranking to choose exactly one category tied for
+the lowest score. Do not inspect for a concrete defect yet.
 Allowed values: {categories}.
 Return only schema, role, category, and a concise rationale under metadata.quality_loop.
 """
@@ -3214,10 +3214,27 @@ def _quality_payload_error(
             return "score_rationale must be non-empty"
         return None
     if role == "select_category":
-        if payload.get("category") not in RANKING_CATEGORIES:
+        category = payload.get("category")
+        if category not in RANKING_CATEGORIES:
             return "category must be one of the five ranking categories"
         if not isinstance(payload.get("rationale"), str) or not payload["rationale"].strip():
             return "rationale must be non-empty"
+        ranking = c.get("last_ranking")
+        try:
+            ranking = json.loads(ranking) if isinstance(ranking, str) else ranking
+        except json.JSONDecodeError:
+            ranking = None
+        if not isinstance(ranking, dict) or set(ranking) != set(RANKING_CATEGORIES):
+            return "category selection requires one complete trusted ranking"
+        lowest = min(float(ranking[name]) for name in RANKING_CATEGORIES)
+        lowest_categories = [
+            name for name in RANKING_CATEGORIES if float(ranking[name]) == lowest
+        ]
+        if category not in lowest_categories:
+            return (
+                f"category must be tied for the lowest TRUSTED_RANKING score ({lowest:g}): "
+                + ", ".join(lowest_categories)
+            )
         return None
     if role == "find_defect":
         verdict = payload.get("verdict")

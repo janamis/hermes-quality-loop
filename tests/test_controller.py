@@ -202,6 +202,44 @@ class QualityLoopControllerTests(unittest.TestCase):
         )
         self.assertIn("Do not find defects", normalized)
 
+        category_body = controller._task_body(campaign, "select_category")
+        self.assertIn("Choose one category tied for the lowest score", category_body)
+
+    def test_category_selection_rejects_a_category_above_the_lowest_score(self):
+        campaign = self.create_campaign(prompt_profile="simple")
+        scores = {
+            "correctness_reliability": 8.5,
+            "security_safety": 7.0,
+            "architecture_maintainability": 9.0,
+            "test_quality": 6.0,
+            "user_experience_performance": 8.0,
+        }
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "examine",
+                "score_breakdown": scores,
+                "score_rationale": "Test quality is the weakest category.",
+            },
+            auto_scope=False,
+        )
+        self.assertEqual(campaign["stage"], "select_category")
+
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "select_category",
+                "category": "architecture_maintainability",
+                "rationale": "Incorrectly chose the highest score.",
+            },
+            auto_scope=False,
+        )
+        self.assertEqual(campaign["state"], "needs_review")
+        self.assertIn("lowest TRUSTED_RANKING score", campaign["message"])
+        self.assertIsNone(campaign["selected_category"])
+
     def test_prompt_profile_rejects_unknown_values(self):
         with self.assertRaisesRegex(ValueError, "prompt_profile"):
             self.create_campaign(prompt_profile="verbose")

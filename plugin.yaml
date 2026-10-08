@@ -1,5 +1,5 @@
 name: quality-loop
-version: 0.3.2
+version: 0.3.3
 manifest_version: 2
 api_version: 1
 description: "Durable Kanban loop: rank, select one category and defect, scope, execute, validate, repair, and repeat."
