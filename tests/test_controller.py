@@ -156,7 +156,8 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertNotIn("execution_slices", body)
         self.assertNotIn("Set `kanban_complete.quality_loop` to exactly:", body)
         self.assertIn("metadata.quality_loop", body)
-        self.assertNotIn("typed top-level", body)
+        self.assertNotIn("typed top-level `quality_loop` compatibility argument", body)
+        self.assertNotIn("QUALITY_LOOP_JSON: ", body)
         self.assertEqual(task.max_runtime_seconds, 1200)
 
     def test_default_campaign_uses_complete_prompt_profile(self):
@@ -172,7 +173,11 @@ class QualityLoopControllerTests(unittest.TestCase):
             body = controller._task_body(campaign, stage)
             # The machine-parsed trusted markers must survive the short profile.
             self.assertIn("TRUSTED_QUALITY_LOOP_CARD", body, stage)
-            self.assertIn("QUALITY_LOOP_JSON: ", body, stage)
+            if stage in {"execute", "validate"}:
+                self.assertIn("typed top-level `quality_loop` compatibility argument", body, stage)
+            else:
+                self.assertNotIn("typed top-level `quality_loop` compatibility argument", body, stage)
+            self.assertNotIn("QUALITY_LOOP_JSON: ", body, stage)
             # Local-model guidance stays short: no multi-paragraph exclusion essays.
             self.assertLess(len(body), 2200, f"{stage} prompt too long for local models")
             self.assertNotIn("Do only these four things", body, stage)
@@ -2868,13 +2873,16 @@ class QualityLoopControllerTests(unittest.TestCase):
             payload,
         )
 
-    def test_task_body_requires_namespaced_metadata(self):
+    def test_task_body_requires_namespaced_metadata_or_typed_compatibility_input(self):
         c = self.create_campaign()
         for stage in ("examine", "scope_validate", "plan", "execute", "validate", "final_validate"):
             body = controller._task_body(c, stage)
             self.assertIn("metadata.quality_loop", body, stage)
-            self.assertIn("Do not pass `quality_loop` as a top-level argument", body, stage)
-            self.assertIn("QUALITY_LOOP_JSON:", body, stage)
+            if stage in {"execute", "validate", "final_validate"}:
+                self.assertIn("typed top-level `quality_loop` compatibility argument", body, stage)
+            else:
+                self.assertNotIn("typed top-level `quality_loop` compatibility argument", body, stage)
+            self.assertNotIn("QUALITY_LOOP_JSON:", body, stage)
             self.assertIn("Do not repeat a failing completion call unchanged", body, stage)
 
     def test_validation_task_body_requires_recoverable_summary_fallback(self):

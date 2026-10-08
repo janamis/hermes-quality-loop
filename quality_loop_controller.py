@@ -681,6 +681,13 @@ def _task_body(c: dict[str, Any], stage: str) -> str:
         separators=(",", ":"),
     )
     simple = str(c.get("prompt_profile") or "complete") == "simple"
+    completion_guidance = (
+        "If this tool model cannot reliably construct nested metadata, pass the same role payload "
+        "through the typed top-level `quality_loop` compatibility argument; the handler stores it "
+        "canonically as `metadata.quality_loop`. "
+        if stage in {"execute", "validate", "integrate_validate", "final_validate"}
+        else ""
+    )
     header = f"""QUALITY LOOP CAMPAIGN: {c['id']}
 ROUND: {c['round_no']}
 ROLE: {stage.upper()}
@@ -690,11 +697,8 @@ WORKSPACE: {c['workspace']}
 This is an autonomous Kanban stage. Work only inside the assigned workspace.
 The final board action MUST be kanban_complete or kanban_block.
 For kanban_complete, put the role payload under `metadata.quality_loop` and write a concise
-human-readable summary. Do not pass `quality_loop` as a top-level argument; stock Hermes rejects
-undeclared top-level parameters.
-If the tool model cannot populate nested metadata, put the complete outer JSON object
-{{"quality_loop": {{...}}}} on one summary line prefixed exactly `QUALITY_LOOP_JSON: `; the
-Quality Loop controller will parse that line while reconciling the completed card.
+human-readable summary. {completion_guidance}Never bury the payload in summary prose or summary
+JSON: hardened cards reject unstructured completion and remain in flight for a retry.
 Do not repeat a failing completion call unchanged.
 """
     if simple:
