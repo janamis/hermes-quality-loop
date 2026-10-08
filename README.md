@@ -27,6 +27,7 @@ The controller registers `on_kanban_dispatch_tick` and never calls an LLM itself
 ## Requirements
 
 - Hermes Agent 0.21.3 or newer
+- Hermes controller-owned Kanban task capability (`hermes_cli.kanban_db_controller`)
 - Hermes Kanban enabled
 - One configured Hermes worker profile
 - Three model names that the profile's provider can route
@@ -79,7 +80,10 @@ Quality Loop never merges or deploys changes.
 
 ## Worker completion contract
 
-Workers complete cards with `metadata.quality_loop.schema = "quality-loop/v1"`. Missing or malformed examination or validation metadata pauses the campaign as `needs_review` instead of guessing.
+Workers complete cards with `metadata.quality_loop.schema = "quality-loop/v1"`. Quality Loop checks
+for the controller-owned Kanban task capability before persisting a campaign, so an incompatible
+Hermes installation fails clearly without leaving a running campaign row. Missing or malformed
+examination or validation metadata pauses the campaign as `needs_review` instead of guessing.
 
 ## Verification
 

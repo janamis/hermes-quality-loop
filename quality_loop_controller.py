@@ -18,10 +18,14 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, cast
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+try:
+    from hermes_cli import kanban_db_controller as controller_tasks
+except ImportError:  # Hermes releases before the controller-task capability.
+    controller_tasks = None
 from hermes_cli.sqlite_util import open_db
 from hermes_constants import get_default_hermes_root
 
@@ -44,6 +48,16 @@ TERMINAL_STATES = {"succeeded", "stopped", "max_rounds", "needs_review"}
 _BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _GIT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 _LOCK = threading.RLock()
+
+
+def _require_controller_task_api() -> Callable[..., str]:
+    create = getattr(controller_tasks, "create_controller_task", None)
+    if not callable(create):
+        raise RuntimeError(
+            "Quality Loop requires Hermes' controller-owned Kanban task API; "
+            "upgrade Hermes before creating or resuming a campaign"
+        )
+    return cast(Callable[..., str], create)
 
 _CAMPAIGN_SCHEMA = """
 CREATE TABLE IF NOT EXISTS campaigns (
@@ -432,6 +446,7 @@ def _validate_create(
 
 
 def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
+    _require_controller_task_api()
     requested_workspace = Path(str(data.get("workspace") or "")).expanduser()
     if not requested_workspace.is_absolute():
         raise ValueError("workspace must be an absolute path")
@@ -521,7 +536,20 @@ def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
         raise
     finally:
         conn.close()
-    reconcile_campaign(campaign_id)
+    try:
+        reconcile_campaign(campaign_id)
+    except Exception as exc:
+        persisted = get_campaign(campaign_id)
+        if persisted is not None and not persisted.get("active_task_id"):
+            _update(
+                campaign_id,
+                state="needs_review",
+                message=(
+                    "Campaign creation failed before first card: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        raise
     result = get_campaign(campaign_id)
     if result is None:
         raise RuntimeError("campaign disappeared after creation")
@@ -547,6 +575,8 @@ def _update(campaign_id: str, **fields: Any) -> None:
 def set_campaign_state(campaign_id: str, action: str) -> dict[str, Any]:
     if action not in {"pause", "resume", "stop"}:
         raise ValueError(f"unknown action: {action}")
+    if action == "resume":
+        _require_controller_task_api()
     with _campaign_process_lock(campaign_id) as acquired:
         if not acquired:
             raise ValueError(f"campaign {campaign_id} is busy reconciling or changing state")
@@ -659,10 +689,10 @@ WORKSPACE: {c['workspace']}
 
 This is an autonomous Kanban stage. Work only inside the assigned workspace.
 The final board action MUST be kanban_complete or kanban_block.
-For kanban_complete, use its typed top-level `quality_loop` argument and write a concise
-human-readable summary. The tool schema is authoritative; do not copy or restate it in the prompt
-or manually nest this object under metadata.
-If the tool model cannot populate the typed argument, put the complete outer JSON object
+For kanban_complete, put the role payload under `metadata.quality_loop` and write a concise
+human-readable summary. Do not pass `quality_loop` as a top-level argument; stock Hermes rejects
+undeclared top-level parameters.
+If the tool model cannot populate nested metadata, put the complete outer JSON object
 {{"quality_loop": {{...}}}} on one summary line prefixed exactly `QUALITY_LOOP_JSON: `; the
 Quality Loop controller will parse that line while reconciling the completed card.
 Do not repeat a failing completion call unchanged.
@@ -673,12 +703,12 @@ Do not repeat a failing completion call unchanged.
         )
     if stage == "discover":
         if simple:
-            return header + f"""
+            return header + """
 READ-ONLY: inspect only. Do not modify or install anything.
 The trusted contract lists allowed commands. Pick build/test commands and max_repairs only from
-TRUSTED_DISCOVERY_CONTRACT. Complete with the typed `discover` quality_loop payload.
+TRUSTED_DISCOVERY_CONTRACT. Put the `discover` payload under `metadata.quality_loop`.
 """
-        return header + f"""
+        return header + """
 READ-ONLY PROJECT DISCOVERY: identify the project type, languages, tracked manifests, and exact
 runtime/build/test commands before any quality ranking or implementation work starts. Do not modify,
 install, create, delete, stage, commit, reset, or restore files. The controller has independently
@@ -687,8 +717,8 @@ Read the named manifests, verify the evidence, and select only commands present 
 TRUSTED_DISCOVERY_CONTRACT. Do not use the Hermes-bundled runtime, ambient PATH, invented commands,
 shell aliases, curl probes, directory placeholders, or commands copied from prose when they are not
 listed in that contract. Choose max_repairs from the bounded trusted candidates: use the smallest
-number justified by project complexity and test feedback cost. Complete with the typed `discover`
-quality_loop payload. At least one selected command must be non-empty. Every non-empty value must
+number justified by project complexity and test feedback cost. Put the `discover` payload under
+`metadata.quality_loop`. At least one selected command must be non-empty. Every non-empty value must
 byte-match the trusted contract. The controller, not this worker, persists the selected configuration.
 """
     if stage == "examine":
@@ -720,8 +750,8 @@ Score these five categories from 0.0 to 10.0:
 
 Then pick the ONE highest-priority defect. Return verdict=proposal with one selected_defect
 (title, description, evidence, proposed_outcome). Return verdict=candidate_complete with no
-selected_defect only when nothing important remains. Complete with the typed `examine`
-quality_loop payload. {completion_action}
+selected_defect only when nothing important remains. Put the `examine` payload under
+`metadata.quality_loop`. {completion_action}
 """
         return header + f"""
 READ-ONLY EXAMINATION: inspect the CURRENT project without modifying source files or creating logs,
@@ -746,18 +776,19 @@ read-only check when it is genuinely necessary to substantiate a score.
 
 The controller computes the arithmetic average. Use proposal with exactly one selected_defect when
 work remains; use candidate_complete without a selected_defect only when the project is ready for final
-validation by {validator}. Complete with the typed `examine` quality_loop payload.
+validation by {validator}. Put the `examine` payload under `metadata.quality_loop`.
 {completion_action}
 """
     if stage == "execute":
         if simple:
             return header + """
 Implement only the selected item in this card. Modify the allowed files, run the exact
-verification commands, then call kanban_complete with the typed `execute` quality_loop payload.
+verification commands, then call kanban_complete with the `execute` payload under
+`metadata.quality_loop`.
 Do NOT commit, stage, or run any git command that changes history — the controller owns Git.
 If a required change falls outside the allowlist, call kanban_block instead of broadening scope.
 """
-        return header + f"""
+        return header + """
 Implement the specification or correction in the parent task result.
 Stay within scope, modify the code, add/update tests, and run relevant verification.
 Do not commit, stage, or otherwise change Git history or HEAD — the controller owns the
@@ -765,8 +796,8 @@ repository state and authenticates your exact working-tree delta at completion t
 If a hidden dependency would require another component, boundary, or file outside the allowlist,
 stop and call kanban_block with the exact dependency instead of broadening the task. After the exact
 verification commands pass, immediately call kanban_complete; do not perform optional cleanup,
-additional refactoring, file-size analysis, or exploratory work. Complete with the typed `execute`
-quality_loop payload.
+additional refactoring, file-size analysis, or exploratory work. Put the `execute` payload under
+`metadata.quality_loop`.
 """
     if stage == "scope_validate":
         if simple:
@@ -776,9 +807,9 @@ Turn the selected defect or repair request into ONE scoped_improvement: one comp
 behavior, one boundary, short implementation instructions, acceptance criteria, the exact trusted
 verification commands, at most five relevant files, excluded scope, and risks. If it cannot be
 scoped safely, return verdict=fail with a correction_prompt. Do not create execution slices.
-Complete with the typed `scope_validate` quality_loop payload.
+Put the `scope_validate` payload under `metadata.quality_loop`.
 """
-        return header + f"""
+        return header + """
 READ-ONLY SCOPE VALIDATION: do not modify, create, delete, stage, commit, reset, or restore files.
 Convert the selected defect or repair request into exactly one component, one observable behavior,
 and one immediate dependency or state boundary. Inspect the real production import, mutable-state,
@@ -786,8 +817,8 @@ lifecycle, database, queue, timer, rendering, and configuration seams before cho
 Produce one scoped_improvement with narrow implementation instructions, acceptance criteria, the exact
 trusted verification commands, no more than five relevant files, explicit excluded scope, and risks.
 Return FAIL with a correction prompt when the finding cannot be scoped safely. Do not decompose the
-work or create execution slices; the planning stage owns that decision. Complete with the typed
-`scope_validate` quality_loop payload.
+work or create execution slices; the planning stage owns that decision. Put the `scope_validate`
+payload under `metadata.quality_loop`.
 """
     if stage == "plan":
         if simple:
@@ -797,9 +828,9 @@ Review the validated scoped improvement. If it fits in at most two relevant file
 decomposition_required=false with no execution_slices. Only when the work genuinely needs ordered
 steps, return decomposition_required=true with 2 to 5 execution_slices; every slice keeps the same
 component and boundary, touches at most two files, and together they cover exactly the parent files.
-Complete with the typed `plan` quality_loop payload.
+Put the `plan` payload under `metadata.quality_loop`.
 """
-        return header + f"""
+        return header + """
 READ-ONLY PLANNING: do not modify, create, delete, stage, commit, reset, or restore files.
 Review the already validated scoped improvement. Keep it as one bounded execution item whenever it can
 be changed and verified safely in at most two relevant files. Set decomposition_required to false in
@@ -809,7 +840,7 @@ Only when dependent steps are genuinely required, set decomposition_required to 
 ordered execution_slices. Every slice must keep the same component and immediate boundary, change one
 coherent behavior, use the exact trusted verification commands, touch at most two relevant files, stay
 inside the parent allowlist, and preserve its excluded scope. The slices must cover exactly the parent
-relevant files. Complete with the typed `plan` quality_loop payload.
+relevant files. Put the `plan` payload under `metadata.quality_loop`.
 """
     if stage == "final_validate":
         final_text = "This is the FINAL whole-codebase audit."
@@ -832,7 +863,7 @@ criteria, and run the required build/tests.
 
 If anything fails or is incomplete, return verdict=fail with a correction_prompt; never fix it
 yourself. On success return verdict=pass with build_passed=true, tests_passed=true, and zero
-critical/high/regression counts. Complete with the typed `validate` quality_loop payload.
+critical/high/regression counts. Put the `validate` payload under `metadata.quality_loop`.
 
 Recovery fallback: your summary MUST also state: Verdict PASS or FAIL; build passes or fails;
 tests pass or fail; acceptance criteria met or unmet; 0 critical issues; 0 high issues; 0 regressions.
@@ -849,7 +880,7 @@ Lower-priority examiner findings are context only: do not implement them and do 
 for this verdict. A fresh examination after a PASS will reconsider them.
 The controller will independently rerun these fixed hard gates after a claimed PASS:
 {gate_lines}
-Complete with the typed `validate` quality_loop payload. PASS is allowed only when build and tests
+Put the `validate` payload under `metadata.quality_loop`. PASS is allowed only when build and tests
 pass, every parent acceptance criterion is met, and critical/high/regression counts are zero.
 As a recovery fallback, your human-readable summary MUST also state all of: Verdict PASS or FAIL;
 build passes or fails; tests pass or fail; acceptance criteria met or unmet; 0 critical issues;
@@ -2731,8 +2762,9 @@ def _create_task(
     )
     conn = kbc.connect(board=c["board"])
     try:
-        return kb.create_quality_loop_task(
+        return _require_controller_task_api()(
             conn,
+            controller=PLUGIN_ID,
             title=f"[{c['name']}] {label} ({suffix})",
             body=(
                 _task_body(c, stage)
@@ -2903,17 +2935,29 @@ def _trusted_card_error(c: dict[str, Any], task: Any, stage: str) -> Optional[st
     body = str(getattr(task, "body", "") or "")
     board_conn = kbc.connect(board=c["board"])
     try:
-        created = [
-            event for event in kb.list_events(board_conn, task.id) if event.kind == "created"
+        events = kb.list_events(board_conn, task.id)
+        created = [event for event in events if event.kind == "created"]
+        provenance = [
+            event for event in events
+            if event.kind == "controller_provenance"
         ]
     finally:
         board_conn.close()
     expected_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    if (
-        len(created) != 1
-        or not isinstance(created[0].payload, dict)
-        or created[0].payload.get("body_sha256") != expected_hash
-    ):
+    legacy_match = (
+        len(created) == 1
+        and isinstance(created[0].payload, dict)
+        and created[0].payload.get("body_sha256") == expected_hash
+    )
+    controller_match = (
+        len(provenance) == 1
+        and provenance[0].payload == {
+            "schema": "hermes/controller-task/v1",
+            "controller": PLUGIN_ID,
+            "body_sha256": expected_hash,
+        }
+    )
+    if not legacy_match and not controller_match:
         return "active card body does not match immutable controller creation provenance"
     lines = body.splitlines()
     expected_header = f"QUALITY LOOP CAMPAIGN: {c['id']}"

@@ -155,6 +155,8 @@ class QualityLoopControllerTests(unittest.TestCase):
         self.assertNotIn("improvement_items", body)
         self.assertNotIn("execution_slices", body)
         self.assertNotIn("Set `kanban_complete.quality_loop` to exactly:", body)
+        self.assertIn("metadata.quality_loop", body)
+        self.assertNotIn("typed top-level", body)
         self.assertEqual(task.max_runtime_seconds, 1200)
 
     def test_default_campaign_uses_complete_prompt_profile(self):
@@ -187,6 +189,44 @@ class QualityLoopControllerTests(unittest.TestCase):
     def test_prompt_profile_rejects_unknown_values(self):
         with self.assertRaisesRegex(ValueError, "prompt_profile"):
             self.create_campaign(prompt_profile="verbose")
+
+    def test_campaign_creation_refuses_missing_controller_api_before_persisting(self):
+        with mock.patch.object(controller, "controller_tasks", None, create=True):
+            with self.assertRaisesRegex(RuntimeError, "controller-owned Kanban task API"):
+                self.create_campaign()
+
+        conn = controller._conn()
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_campaign_resume_refuses_missing_controller_api_without_state_change(self):
+        campaign = self.create_campaign()
+        campaign = controller.set_campaign_state(campaign["id"], "stop")
+        self.assertEqual(campaign["state"], "stopped")
+
+        with mock.patch.object(controller, "controller_tasks", None, create=True):
+            with self.assertRaisesRegex(RuntimeError, "controller-owned Kanban task API"):
+                controller.set_campaign_state(campaign["id"], "resume")
+
+        persisted = controller.get_campaign(campaign["id"])
+        self.assertEqual(persisted["state"], "stopped")
+
+    def test_campaign_creation_failure_is_persisted_as_needs_review(self):
+        with mock.patch.object(
+            controller,
+            "_create_task",
+            side_effect=RuntimeError("forced first-card failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forced first-card failure"):
+                self.create_campaign()
+
+        campaigns = controller.list_campaigns()
+        self.assertEqual(len(campaigns), 1)
+        self.assertEqual(campaigns[0]["state"], "needs_review")
+        self.assertIsNone(campaigns[0]["active_task_id"])
+        self.assertIn("first card", campaigns[0]["message"].lower())
 
     def test_simple_profile_retains_validator_gate_lines_and_fallback_wording(self):
         campaign = self.create_campaign(prompt_profile="simple")
@@ -2828,11 +2868,12 @@ class QualityLoopControllerTests(unittest.TestCase):
             payload,
         )
 
-    def test_task_body_requires_metadata_argument(self):
+    def test_task_body_requires_namespaced_metadata(self):
         c = self.create_campaign()
         for stage in ("examine", "scope_validate", "plan", "execute", "validate", "final_validate"):
             body = controller._task_body(c, stage)
-            self.assertIn("typed top-level `quality_loop` argument", body, stage)
+            self.assertIn("metadata.quality_loop", body, stage)
+            self.assertIn("Do not pass `quality_loop` as a top-level argument", body, stage)
             self.assertIn("QUALITY_LOOP_JSON:", body, stage)
             self.assertIn("Do not repeat a failing completion call unchanged", body, stage)
 
@@ -3292,7 +3333,10 @@ class QualityLoopControllerTests(unittest.TestCase):
             os.environ["HERMES_KANBAN_RUN_ID"] = str(run_id)
             outcome = json.loads(
                 kt._handle_complete(
-                    {"summary": f"Completed {payload['role']}.", "quality_loop": payload}
+                    {
+                        "summary": f"Completed {payload['role']}.",
+                        "metadata": {"quality_loop": payload},
+                    }
                 )
             )
             self.assertTrue(outcome.get("ok"), outcome)
