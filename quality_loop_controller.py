@@ -754,8 +754,10 @@ Score these five categories from 0.0 to 10.0:
 
 Then pick the ONE highest-priority defect. Return verdict=proposal with one selected_defect
 (title, description, evidence, proposed_outcome). Return verdict=candidate_complete with no
-selected_defect only when nothing important remains. Put the `examine` payload under
-`metadata.quality_loop`. {completion_action}
+selected_defect only when nothing important remains. The `metadata.quality_loop` object must use
+schema `quality-loop/v1`, role `examine`, and only these fields: schema, role, verdict,
+score_breakdown, score_rationale, plus selected_defect for a proposal. Do not include any other
+quality_loop fields. {completion_action}
 """
         return header + f"""
 READ-ONLY EXAMINATION: inspect the CURRENT project without modifying source files or creating logs,
@@ -780,7 +782,9 @@ read-only check when it is genuinely necessary to substantiate a score.
 
 The controller computes the arithmetic average. Use proposal with exactly one selected_defect when
 work remains; use candidate_complete without a selected_defect only when the project is ready for final
-validation by {validator}. Put the `examine` payload under `metadata.quality_loop`.
+validation by {validator}. The `metadata.quality_loop` object must use schema `quality-loop/v1`, role
+`examine`, and only these fields: schema, role, verdict, score_breakdown, score_rationale, plus
+selected_defect for a proposal. Do not include any other quality_loop fields.
 {completion_action}
 """
     if stage == "execute":

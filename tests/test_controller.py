@@ -183,13 +183,19 @@ class QualityLoopControllerTests(unittest.TestCase):
             self.assertNotIn("Do only these four things", body, stage)
             self.assertNotIn("READ-ONLY EXAMINATION: inspect the CURRENT project", body, stage)
 
-    def test_simple_profile_examine_prompt_names_all_five_categories(self):
+    def test_simple_profile_examine_prompt_names_exact_handoff_fields_and_categories(self):
         campaign = self.create_campaign(prompt_profile="simple")
         body = controller._task_body(campaign, "examine")
         for category in controller.RANKING_CATEGORIES:
             self.assertIn(category, body)
         self.assertIn("one", body.lower())
         self.assertIn("defect", body.lower())
+        normalized = " ".join(body.split())
+        self.assertIn(
+            "schema, role, verdict, score_breakdown, score_rationale",
+            normalized,
+        )
+        self.assertIn("Do not include any other quality_loop fields", normalized)
 
     def test_prompt_profile_rejects_unknown_values(self):
         with self.assertRaisesRegex(ValueError, "prompt_profile"):
