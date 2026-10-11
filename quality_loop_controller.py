@@ -933,8 +933,10 @@ ROLE: {stage.upper()}
 TRUSTED_QUALITY_LOOP_CARD: {marker}
 WORKSPACE: {c['workspace']}
 
-Do only this card's job. Finish with kanban_complete and put the exact payload under
-metadata.quality_loop. {summary_guidance} Use kanban_block only when truly blocked.
+Do only this card's job. Finish with kanban_complete. The summary MUST be exactly one JSON line
+starting `QUALITY_LOOP_JSON: `. After that prefix, write a JSON object whose only key is
+`quality_loop`; its value is the exact role payload below with real values.
+Do not write a prose summary or put the payload in metadata. Use kanban_block only when blocked.
 """
     else:
         header = f"""QUALITY LOOP CAMPAIGN: {c['id']}
@@ -954,7 +956,8 @@ Do not repeat a failing completion call unchanged.
             return header + """
 READ-ONLY: inspect only. Do not modify or install anything.
 The trusted contract lists allowed commands. Pick build/test commands and max_repairs only from
-TRUSTED_DISCOVERY_CONTRACT. Put the `discover` payload under `metadata.quality_loop`.
+TRUSTED_DISCOVERY_CONTRACT. Payload fields: schema, role=discover, verdict=configured, project_kind,
+languages, manifests, build_command, test_command, max_repairs, and runtime_evidence.
 """
         return header + """
 READ-ONLY PROJECT DISCOVERY: identify the project type, languages, tracked manifests, and exact
@@ -1027,7 +1030,8 @@ without selected_defect only when no important defect exists in that category.
         if simple:
             return header + """
 Implement only SELECTED ITEM. Change only allowed files. Run the exact commands. Do not use git.
-If the change needs another file, call kanban_block. Return the execute payload and stop.
+If the change needs another file, call kanban_block.
+Payload fields: schema, role=execute, changed_files, verification (command and exit_code 0), residual_risk.
 """
         return header + """
 Implement the specification or correction in the parent task result.
@@ -1066,7 +1070,7 @@ Review the validated scoped improvement. If it fits in at most two relevant file
 decomposition_required=false with no execution_slices. Only when the work genuinely needs ordered
 steps, return decomposition_required=true with 2 to 5 execution_slices; every slice keeps the same
 component and boundary, touches at most two files, and together they cover exactly the parent files.
-Put the `plan` payload under `metadata.quality_loop`.
+Payload fields: schema, role=plan, decomposition_required, rationale, and execution_slices only when true.
 """
         return header + """
 READ-ONLY PLANNING: do not modify, create, delete, stage, commit, reset, or restore files.
@@ -1099,13 +1103,10 @@ criteria, and run the required build/tests.
 
 {gate_lines}
 
-If anything fails or is incomplete, return verdict=fail with a correction_prompt; never fix it
-yourself. On success return verdict=pass with build_passed=true, tests_passed=true, and zero
-critical/high/regression counts. Put the `validate` payload under `metadata.quality_loop`.
-
-Recovery fallback: your summary MUST also state: Verdict PASS or FAIL; build passes or fails;
-tests pass or fail; acceptance criteria met or unmet; 0 critical issues; 0 high issues; 0 regressions.
-On FAIL, include a specific correction prompt in the summary.
+If anything fails or is incomplete, return verdict=fail with a correction_prompt; never fix it.
+On success return verdict=pass with passing booleans and zero issue counts.
+Payload fields: schema, role=validate, verdict, build_passed, tests_passed, critical_issues,
+high_issues, regressions, findings; add correction_prompt only on FAIL.
 """
     return header + f"""
 {final_text}

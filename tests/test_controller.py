@@ -694,18 +694,24 @@ else:
         campaign = self.create_campaign(prompt_profile="simple")
         self.assertEqual(campaign["prompt_profile"], "simple")
         for stage in (
-            "examine", "select_category", "find_defect", "scope_validate",
-            "plan", "execute", "validate",
+            "discover", "examine", "select_category", "find_defect", "scope_validate",
+            "plan", "execute", "validate", "integrate_validate", "final_validate",
         ):
             body = controller._task_body(campaign, stage)
             # The machine-parsed trusted markers must survive the short profile.
             self.assertIn("TRUSTED_QUALITY_LOOP_CARD", body, stage)
             self.assertNotIn("typed top-level `quality_loop` compatibility argument", body, stage)
             self.assertIn("QUALITY_LOOP_JSON: ", body, stage)
+            self.assertIn("The summary MUST be exactly one JSON line", body, stage)
+            self.assertIn("Do not write a prose summary or put the payload in metadata", body, stage)
+            self.assertNotIn("metadata.quality_loop", body, stage)
+            self.assertNotRegex(body, r"<[^>\n]+>", stage)
             # Local-model guidance is one small job, not a compressed essay.
             self.assertLess(len(body), 1300, f"{stage} prompt too long for local models")
             self.assertNotIn("Do only these four things", body, stage)
             self.assertNotIn("READ-ONLY EXAMINATION: inspect the CURRENT project", body, stage)
+        execute_body = controller._task_body(campaign, "execute")
+        self.assertIn("Payload fields: schema, role=execute", execute_body)
 
     def test_simple_profile_ranks_before_any_defect_work(self):
         campaign = self.create_campaign(prompt_profile="simple")
@@ -801,12 +807,13 @@ else:
         self.assertIsNone(campaigns[0]["active_task_id"])
         self.assertIn("first card", campaigns[0]["message"].lower())
 
-    def test_simple_profile_retains_validator_gate_lines_and_fallback_wording(self):
+    def test_simple_profile_retains_validator_gate_lines_and_structured_payload_guidance(self):
         campaign = self.create_campaign(prompt_profile="simple")
         body = controller._task_body(campaign, "validate")
         self.assertIn("- build: `true`", body)
         self.assertIn("- test: `true`", body)
-        self.assertIn("Verdict PASS or FAIL", body)
+        self.assertIn("Payload fields: schema, role=validate", body)
+        self.assertNotIn("Recovery fallback", body)
 
     def test_simple_profile_targets_and_publish_lines_survive(self):
         campaign = self.create_campaign(
