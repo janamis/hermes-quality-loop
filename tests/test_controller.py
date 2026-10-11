@@ -680,7 +680,7 @@ else:
         self.assertNotIn("Set `kanban_complete.quality_loop` to exactly:", body)
         self.assertIn("metadata.quality_loop", body)
         self.assertNotIn("typed top-level `quality_loop` compatibility argument", body)
-        self.assertNotIn("QUALITY_LOOP_JSON: ", body)
+        self.assertIn("QUALITY_LOOP_JSON: ", body)
         self.assertEqual(task.max_runtime_seconds, 1200)
 
     def test_default_campaign_uses_complete_prompt_profile(self):
@@ -700,11 +700,8 @@ else:
             body = controller._task_body(campaign, stage)
             # The machine-parsed trusted markers must survive the short profile.
             self.assertIn("TRUSTED_QUALITY_LOOP_CARD", body, stage)
-            if stage in {"execute", "validate"}:
-                self.assertIn("typed top-level `quality_loop` compatibility argument", body, stage)
-            else:
-                self.assertNotIn("typed top-level `quality_loop` compatibility argument", body, stage)
-            self.assertNotIn("QUALITY_LOOP_JSON: ", body, stage)
+            self.assertNotIn("typed top-level `quality_loop` compatibility argument", body, stage)
+            self.assertIn("QUALITY_LOOP_JSON: ", body, stage)
             # Local-model guidance is one small job, not a compressed essay.
             self.assertLess(len(body), 1300, f"{stage} prompt too long for local models")
             self.assertNotIn("Do only these four things", body, stage)
@@ -3595,6 +3592,43 @@ else:
         payload = controller._handoff(run, expected_role="examine")
         self.assertIsNone(payload)
 
+    def test_exact_quality_loop_json_summary_is_hardened_typed_handoff(self):
+        payload = self.proposal()
+        summary = "QUALITY_LOOP_JSON: " + json.dumps({"quality_loop": payload})
+        run = SimpleNamespace(metadata={"worker_session_id": "session-1"}, summary=summary)
+        self.assertEqual(controller._handoff(run, expected_role="examine"), payload)
+
+    def test_exact_quality_loop_json_summary_advances_hardened_campaign(self):
+        campaign = self.create_campaign()
+        payload = {
+            "schema": controller.SCHEMA,
+            "role": "examine",
+            "score_breakdown": {
+                category: 8.0 for category in controller.RANKING_CATEGORIES
+            },
+            "score_rationale": "Structured fallback payload from a tool-limited model.",
+        }
+        summary = "QUALITY_LOOP_JSON: " + json.dumps({"quality_loop": payload})
+        campaign = self.complete(campaign, None, summary=summary, auto_scope=False)
+        self.assertEqual(campaign["state"], "running")
+        self.assertEqual(campaign["stage"], "select_category")
+        self.assertEqual(campaign["last_average"], 8.0)
+
+    def test_strict_summary_fallback_rejects_ambiguous_or_pathological_json(self):
+        summaries = (
+            'QUALITY_LOOP_JSON: {"quality_loop":{},"quality_loop":{}}',
+            'QUALITY_LOOP_JSON: {"quality_loop":{"schema":"first","schema":"second"}}',
+            'QUALITY_LOOP_JSON: {"quality_loop":{"number":' + ("9" * 10000) + '}}',
+            'QUALITY_LOOP_JSON: {"quality_loop":' + ("[" * 2000) + "0" + ("]" * 2000) + '}',
+            'QUALITY_LOOP_JSON: {"quality_loop":{}} trailing',
+            'QUALITY_LOOP_JSON: []',
+            'QUALITY_LOOP_JSON: {"quality_loop":{},"extra":true}',
+        )
+        for summary in summaries:
+            with self.subTest(summary=summary[:80]):
+                run = SimpleNamespace(metadata={}, summary=summary)
+                self.assertIsNone(controller._handoff(run, expected_role="examine"))
+
     def test_quality_loop_json_prefix_is_parsed_from_summary(self):
         payload = self.proposal()
         summary = "Worker summary\nQUALITY_LOOP_JSON: " + json.dumps({"quality_loop": payload})
@@ -3615,11 +3649,9 @@ else:
         ):
             body = controller._task_body(c, stage)
             self.assertIn("metadata.quality_loop", body, stage)
-            if stage in {"execute", "validate", "final_validate"}:
-                self.assertIn("typed top-level `quality_loop` compatibility argument", body, stage)
-            else:
-                self.assertNotIn("typed top-level `quality_loop` compatibility argument", body, stage)
-            self.assertNotIn("QUALITY_LOOP_JSON:", body, stage)
+            self.assertNotIn("typed top-level `quality_loop` compatibility argument", body, stage)
+            self.assertIn("QUALITY_LOOP_JSON:", body, stage)
+            self.assertIn("replace `<same role payload>`", body, stage)
             self.assertIn("Do not repeat a failing completion call unchanged", body, stage)
 
     def test_validation_task_body_requires_recoverable_summary_fallback(self):

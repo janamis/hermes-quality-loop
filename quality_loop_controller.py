@@ -922,18 +922,11 @@ def _task_body(c: dict[str, Any], stage: str) -> str:
         separators=(",", ":"),
     )
     simple = str(c.get("prompt_profile") or "complete") == "simple"
-    completion_guidance = (
-        "If this tool model cannot reliably construct nested metadata, pass the same role payload "
-        "through the typed top-level `quality_loop` compatibility argument; the handler stores it "
-        "canonically as `metadata.quality_loop`. "
-        if stage in {"execute", "validate", "integrate_validate", "final_validate"}
-        else ""
+    summary_guidance = (
+        "Fallback summary: `QUALITY_LOOP_JSON: {\"quality_loop\":<same role payload>}` only; "
+        "replace `<same role payload>` with exact payload JSON."
     )
     if simple:
-        typed = (
-            " The typed top-level `quality_loop` compatibility argument is also accepted."
-            if completion_guidance else ""
-        )
         header = f"""QUALITY LOOP CAMPAIGN: {c['id']}
 ROUND: {c['round_no']}
 ROLE: {stage.upper()}
@@ -941,7 +934,7 @@ TRUSTED_QUALITY_LOOP_CARD: {marker}
 WORKSPACE: {c['workspace']}
 
 Do only this card's job. Finish with kanban_complete and put the exact payload under
-metadata.quality_loop.{typed} Use kanban_block only when truly blocked.
+metadata.quality_loop. {summary_guidance} Use kanban_block only when truly blocked.
 """
     else:
         header = f"""QUALITY LOOP CAMPAIGN: {c['id']}
@@ -953,8 +946,7 @@ WORKSPACE: {c['workspace']}
 This is an autonomous Kanban stage. Work only inside the assigned workspace.
 The final board action MUST be kanban_complete or kanban_block.
 For kanban_complete, put the role payload under `metadata.quality_loop` and write a concise
-human-readable summary. {completion_guidance}Never bury the payload in summary prose or summary
-JSON: hardened cards reject unstructured completion and remain in flight for a retry.
+human-readable summary. {summary_guidance}
 Do not repeat a failing completion call unchanged.
 """
     if stage == "discover":
@@ -3166,6 +3158,19 @@ def _summary_fallback_handoff(run: Any, expected_role: str | None) -> Optional[d
     return None
 
 
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKey(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def _handoff(
     run: Any,
     *,
@@ -3185,12 +3190,28 @@ def _handoff(
         candidate = meta.get("quality_loop")
         if isinstance(candidate, dict):
             return candidate
+    text = (run.summary or "").strip()
+    strict_prefix = "QUALITY_LOOP_JSON: "
+    if text.startswith(strict_prefix):
+        raw_json = text.removeprefix(strict_prefix)
+        if len(raw_json) > 64 * 1024:
+            parsed = None
+        else:
+            try:
+                parsed = json.loads(raw_json, object_pairs_hook=_reject_duplicate_json_keys)
+            except (TypeError, ValueError, RecursionError):
+                parsed = None
+        if (
+            isinstance(parsed, dict)
+            and set(parsed) == {"quality_loop"}
+            and isinstance(parsed.get("quality_loop"), dict)
+        ):
+            return parsed["quality_loop"]
     if not allow_pre_hardening_migration:
         return None
     if meta:
         if meta.get("schema") == SCHEMA and isinstance(meta.get("role"), str):
             return meta
-    text = (run.summary or "").strip()
     for line in text.splitlines():
         if not line.startswith("QUALITY_LOOP_JSON: "):
             continue
