@@ -54,6 +54,9 @@ class CampaignCreate(BaseModel):
     provider_override: Optional[str] = None
     build_command: str = ""
     test_command: str = ""
+    isolation_mode: Literal["workspace", "podman"] = "workspace"
+    container_image: Optional[str] = None
+    container_network: Literal["none", "slirp4netns"] = "none"
     gate_timeout_seconds: int = Field(default=900, ge=10, le=3600)
     target_average: Optional[float] = Field(default=None, gt=0, le=10)
     publish_on_success: bool = False
@@ -111,7 +114,7 @@ def model_catalog(profile: str, provider: str):
 def create_campaign(body: CampaignCreate):
     try:
         return {"campaign": controller.create_campaign(body.model_dump())}
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

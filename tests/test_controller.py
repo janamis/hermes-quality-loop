@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,6 +139,360 @@ class QualityLoopControllerTests(unittest.TestCase):
             controller, "_safe_publication_remote_url", return_value=str(remote)
         ):
             return controller._publish_success(campaign)
+
+    def fake_podman(self) -> tuple[Path, Path, Path]:
+        """Return an executable fake plus its volume root and invocation log."""
+        root = Path(self.temp.name) / "fake-podman-volumes"
+        log = Path(self.temp.name) / "fake-podman.log"
+        executable = Path(self.temp.name) / "podman"
+        executable.write_text(
+            """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+root = Path(os.environ["FAKE_PODMAN_ROOT"])
+log = Path(os.environ["FAKE_PODMAN_LOG"])
+root.mkdir(parents=True, exist_ok=True)
+with log.open("a", encoding="utf-8") as handle:
+    handle.write("\\0".join(args) + "\\n")
+if args[:2] == ["info", "--format"]:
+    print("true")
+elif args[:2] == ["volume", "create"]:
+    name = args[-1]
+    (root / name / "_data").mkdir(parents=True, exist_ok=True)
+    print(name)
+elif args[:2] == ["volume", "inspect"]:
+    name = args[-1]
+    print(root / name / "_data")
+elif args[:2] == ["image", "inspect"]:
+    print("a" * 64)
+elif args and args[0] == "run":
+    print("container gate passed")
+elif args[:2] == ["volume", "rm"]:
+    print(args[-1])
+else:
+    raise SystemExit("unsupported fake podman command: " + repr(args))
+""",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        return executable, root, log
+
+    def test_podman_campaign_uses_fresh_volume_checkout_and_preserves_source(self):
+        executable, volume_root, log = self.fake_podman()
+        source_bytes = (self.workspace / "app.py").read_bytes()
+        with (
+            mock.patch.object(controller, "_system_podman", return_value=str(executable)),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "FAKE_PODMAN_ROOT": str(volume_root),
+                    "FAKE_PODMAN_LOG": str(log),
+                },
+            ),
+        ):
+            campaign = self.create_campaign(
+                isolation_mode="podman",
+                container_image="example.invalid/quality-loop@sha256:" + "b" * 64,
+            )
+
+        self.assertEqual(campaign["source_workspace"], str(self.workspace.resolve()))
+        self.assertEqual(campaign["isolation_mode"], "podman")
+        self.assertTrue(campaign["podman_volume"].startswith("hermes-quality-loop-"))
+        self.assertEqual(campaign["container_image_id"], "sha256:" + "a" * 64)
+        isolated = Path(campaign["workspace"])
+        self.assertNotEqual(isolated, self.workspace.resolve())
+        self.assertTrue((isolated / ".git").exists())
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(isolated), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            subprocess.run(
+                ["git", "-C", str(self.workspace), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+        )
+
+        (isolated / "app.py").write_text("container-only change\n", encoding="utf-8")
+        self.assertEqual((self.workspace / "app.py").read_bytes(), source_bytes)
+        conn = kbc.connect(board=campaign["board"])
+        try:
+            task = kb.get_task(conn, campaign["active_task_id"])
+        finally:
+            conn.close()
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task.workspace_path, str(isolated))
+
+    def test_podman_campaign_runs_hard_gates_through_pinned_container(self):
+        executable, volume_root, log = self.fake_podman()
+        with (
+            mock.patch.object(controller, "_system_podman", return_value=str(executable)),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "FAKE_PODMAN_ROOT": str(volume_root),
+                    "FAKE_PODMAN_LOG": str(log),
+                },
+            ),
+        ):
+            campaign = self.create_campaign(
+                isolation_mode="podman",
+                container_image="example.invalid/quality-loop@sha256:" + "b" * 64,
+                container_network="none",
+                build_command="printf build",
+                test_command="printf test",
+            )
+            result = controller._run_gates(campaign)
+
+        self.assertTrue(result["ok"])
+        invocations = log.read_text(encoding="utf-8").splitlines()
+        gate_runs = [line.split("\0") for line in invocations if line.startswith("run\0")]
+        self.assertEqual(len(gate_runs), 2)
+        for command in gate_runs:
+            self.assertIn("--rm", command)
+            self.assertIn("--network=none", command)
+            self.assertIn("--pull=never", command)
+            self.assertIn("--entrypoint=/bin/sh", command)
+            self.assertIn("--cap-drop=all", command)
+            self.assertIn("no-new-privileges", command)
+            self.assertIn("--read-only", command)
+            self.assertIn("/tmp:rw,noexec,nosuid,nodev,size=512m", command)
+            self.assertIn(f"{campaign['podman_volume']}:/workspace:rw", command)
+            self.assertIn("/workspace/repository", command)
+            self.assertIn(campaign["container_image_id"], command)
+
+    def test_podman_creation_removes_volume_when_isolated_snapshot_fails(self):
+        executable, volume_root, log = self.fake_podman()
+        original = controller._execution_git_state_with_root
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("snapshot failed")
+            return original(*args, **kwargs)
+
+        with (
+            mock.patch.object(controller, "_system_podman", return_value=str(executable)),
+            mock.patch.object(controller, "_execution_git_state_with_root", side_effect=fail_second),
+            mock.patch.dict(
+                os.environ,
+                {"FAKE_PODMAN_ROOT": str(volume_root), "FAKE_PODMAN_LOG": str(log)},
+            ),
+            self.assertRaisesRegex(RuntimeError, "snapshot failed"),
+        ):
+            self.create_campaign(
+                isolation_mode="podman",
+                container_image="example.invalid/quality-loop@sha256:" + "b" * 64,
+            )
+
+        invocations = [line.split("\0") for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(command[:3] == ["volume", "rm", "--force"] for command in invocations))
+
+    def test_podman_command_removes_remote_connection_environment(self):
+        completed = subprocess.CompletedProcess([], 0, "true\n", None)
+        inherited = {
+            "CONTAINER_HOST": "ssh://attacker.invalid/run/podman.sock",
+            "CONTAINER_CONNECTION": "untrusted",
+            "CONTAINER_SSHKEY": "/tmp/untrusted-key",
+            "CONTAINERS_CONF": "/tmp/untrusted-containers.conf",
+            "PODMAN_CONNECTIONS_CONF": "/tmp/untrusted-connections.json",
+        }
+        with (
+            mock.patch.object(controller, "_system_podman", return_value="/usr/bin/podman"),
+            mock.patch.object(controller.subprocess, "run", return_value=completed) as run,
+            mock.patch.dict(os.environ, inherited, clear=False),
+        ):
+            controller._podman_command("info")
+        child_env = run.call_args.kwargs["env"]
+        self.assertFalse(any(key.startswith("CONTAINER_") for key in child_env))
+        self.assertFalse(any(key.startswith("CONTAINERS_") for key in child_env))
+        self.assertFalse(any(key.startswith("PODMAN_") for key in child_env))
+
+    def test_podman_timeout_cleanup_timeout_is_fatal(self):
+        timeout = subprocess.TimeoutExpired(["podman", "run"], 30)
+        cleanup_timeout = subprocess.TimeoutExpired(["podman", "rm"], 60)
+        campaign = {
+            "podman_volume": "hermes-quality-loop-abcdef123456",
+            "container_image_id": "sha256:" + "a" * 64,
+            "container_network": "none",
+        }
+        with mock.patch.object(controller, "_podman_command", side_effect=[timeout, cleanup_timeout]):
+            with self.assertRaisesRegex(RuntimeError, "could not stop timed-out"):
+                controller._run_podman_gate(campaign, "test", "false", 30)
+
+    def test_podman_volume_create_timeout_attempts_verified_cleanup(self):
+        completed = subprocess.CompletedProcess
+        commands = [
+            completed([], 0, "true\n", None),
+            completed([], 0, "a" * 64 + "\n", None),
+            subprocess.TimeoutExpired(["podman", "volume", "create"], 120),
+            completed([], 0, "hermes-quality-loop-abcdef123456\n", None),
+        ]
+        with mock.patch.object(controller, "_podman_command", side_effect=commands) as podman:
+            with self.assertRaisesRegex(RuntimeError, "volume creation timed out"):
+                controller._prepare_podman_workspace(
+                    "ql_abcdef123456",
+                    self.workspace,
+                    subprocess.run(
+                        ["git", "-C", str(self.workspace), "rev-parse", "HEAD"],
+                        check=True, capture_output=True, text=True,
+                    ).stdout.strip(),
+                    "example.invalid/quality-loop@sha256:" + "b" * 64,
+                )
+        self.assertEqual(podman.call_args_list[-1].args[:3], ("volume", "rm", "--force"))
+
+    def test_podman_database_failure_surfaces_volume_cleanup_failure(self):
+        executable, volume_root, log = self.fake_podman()
+        with (
+            mock.patch.object(controller, "_system_podman", return_value=str(executable)),
+            mock.patch.object(controller, "_conn", side_effect=RuntimeError("database unavailable")),
+            mock.patch.object(controller, "_remove_podman_volume", return_value=False),
+            mock.patch.dict(
+                os.environ,
+                {"FAKE_PODMAN_ROOT": str(volume_root), "FAKE_PODMAN_LOG": str(log)},
+            ),
+            self.assertRaisesRegex(RuntimeError, "could not remove campaign Podman volume"),
+        ):
+            self.create_campaign(
+                isolation_mode="podman",
+                container_image="example.invalid/quality-loop@sha256:" + "b" * 64,
+            )
+
+    def test_podman_creation_removes_volume_when_database_open_fails(self):
+        executable, volume_root, log = self.fake_podman()
+        with (
+            mock.patch.object(controller, "_system_podman", return_value=str(executable)),
+            mock.patch.object(controller, "_conn", side_effect=RuntimeError("database unavailable")),
+            mock.patch.dict(
+                os.environ,
+                {"FAKE_PODMAN_ROOT": str(volume_root), "FAKE_PODMAN_LOG": str(log)},
+            ),
+            self.assertRaisesRegex(RuntimeError, "database unavailable"),
+        ):
+            self.create_campaign(
+                isolation_mode="podman",
+                container_image="example.invalid/quality-loop@sha256:" + "b" * 64,
+            )
+
+        invocations = [line.split("\0") for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(command[:3] == ["volume", "rm", "--force"] for command in invocations))
+
+    def test_podman_volume_with_unexpected_create_output_is_removed(self):
+        completed = subprocess.CompletedProcess
+        commands = [
+            completed([], 0, "true\n", None),
+            completed([], 0, "a" * 64 + "\n", None),
+            completed([], 0, "warning\nhermes-quality-loop-abcdef123456\n", None),
+            completed([], 0, "hermes-quality-loop-abcdef123456\n", None),
+        ]
+        with mock.patch.object(controller, "_podman_command", side_effect=commands) as podman:
+            with self.assertRaisesRegex(RuntimeError, "could not create"):
+                controller._prepare_podman_workspace(
+                    "ql_abcdef123456",
+                    self.workspace,
+                    subprocess.run(
+                        ["git", "-C", str(self.workspace), "rev-parse", "HEAD"],
+                        check=True, capture_output=True, text=True,
+                    ).stdout.strip(),
+                    "example.invalid/quality-loop@sha256:" + "b" * 64,
+                )
+        self.assertEqual(podman.call_args_list[-1].args[:3], ("volume", "rm", "--force"))
+
+    def test_podman_timeout_cleanup_failure_is_fatal(self):
+        timeout = subprocess.TimeoutExpired(["podman", "run"], 30)
+        removal = subprocess.CompletedProcess([], 1, "container still running", None)
+        campaign = {
+            "podman_volume": "hermes-quality-loop-abcdef123456",
+            "container_image_id": "sha256:" + "a" * 64,
+            "container_network": "none",
+        }
+        with mock.patch.object(controller, "_podman_command", side_effect=[timeout, removal]):
+            with self.assertRaisesRegex(RuntimeError, "could not stop timed-out"):
+                controller._run_podman_gate(campaign, "test", "false", 30)
+
+    def test_fatal_hard_gate_error_pauses_campaign_for_review(self):
+        c = self.create_campaign(build_command="true", test_command="false")
+        c = self.complete(c, self.proposal(commands=["true", "false"]))
+        self.assertEqual(c["stage"], "execute", c)
+        c = self.complete(c, {"schema": controller.SCHEMA, "role": "execute"})
+        fatal = {
+            "ok": False,
+            "fatal_error": "could not stop timed-out Podman gate container",
+            "commands": [],
+            "checked_at": int(time.time()),
+        }
+        with mock.patch.object(controller, "_run_gates", return_value=fatal):
+            c = self.complete(c, self.passing_validation())
+        self.assertEqual(c["state"], "needs_review")
+        self.assertIn("could not stop timed-out", c["message"])
+
+    def test_podman_publication_uses_source_remote_without_mutating_source_checkout(self):
+        source = Path(self.temp.name) / "podman-publish-source"
+        isolated = Path(self.temp.name) / "podman-publish-isolated"
+        remote = Path(self.temp.name) / "podman-publish-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "config", "user.name", "Quality Loop Test"], check=True)
+        subprocess.run(["git", "-C", str(source), "config", "user.email", "quality-loop@example.invalid"], check=True)
+        (source / "app.txt").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "app.txt"], check=True)
+        subprocess.run(["git", "-C", str(source), "commit", "-m", "baseline"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(["git", "clone", "--no-local", str(source), str(isolated)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(isolated), "remote", "remove", "origin"], check=True)
+        source_head = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        initial = controller._execution_git_state(str(isolated))
+        (isolated / "app.txt").write_text("verified improvement\n", encoding="utf-8")
+        authenticated = controller._execution_git_state(str(isolated))
+        authenticated["publication"] = controller._publication_manifest(str(isolated), ["app.txt"])
+
+        result = self.publish_to_local_test_remote(
+            {
+                "workspace": str(isolated),
+                "source_workspace": str(source),
+                "source_snapshot": controller._execution_git_state(str(source)),
+                "source_branch": "main",
+                "isolation_mode": "podman",
+                "publish_remote": "origin",
+                "publish_branch": None,
+                "commit_message": "quality-loop: isolated result",
+                "initial_snapshot": initial,
+                "authenticated_snapshot": authenticated,
+            },
+            remote,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/main"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip(),
+            result["commit"],
+        )
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip(),
+            source_head,
+        )
+        self.assertEqual((source / "app.txt").read_text(encoding="utf-8"), "baseline\n")
+        self.assertNotIn("origin", subprocess.run(
+            ["git", "-C", str(isolated), "remote"], check=True, capture_output=True, text=True,
+        ).stdout.split())
 
     def test_examine_card_is_narrow_and_bounded_to_twenty_minutes(self):
         campaign = self.create_campaign(target_average=9.0)

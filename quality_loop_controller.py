@@ -65,6 +65,14 @@ CREATE TABLE IF NOT EXISTS campaigns (
     name TEXT NOT NULL,
     board TEXT NOT NULL,
     workspace TEXT NOT NULL,
+    source_workspace TEXT,
+    source_snapshot TEXT,
+    source_branch TEXT,
+    isolation_mode TEXT NOT NULL DEFAULT 'workspace',
+    podman_volume TEXT,
+    container_image TEXT,
+    container_image_id TEXT,
+    container_network TEXT NOT NULL DEFAULT 'none',
     assignee TEXT NOT NULL,
     examiner_model TEXT NOT NULL,
     executor_model TEXT NOT NULL,
@@ -127,6 +135,14 @@ def _conn() -> sqlite3.Connection:
     # Additive migration for campaigns created by pre-release versions.
     existing = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
     migrations = {
+        "source_workspace": "TEXT",
+        "source_snapshot": "TEXT",
+        "source_branch": "TEXT",
+        "isolation_mode": "TEXT NOT NULL DEFAULT 'workspace'",
+        "podman_volume": "TEXT",
+        "container_image": "TEXT",
+        "container_image_id": "TEXT",
+        "container_network": "TEXT NOT NULL DEFAULT 'none'",
         "build_command": "TEXT NOT NULL DEFAULT ''",
         "test_command": "TEXT NOT NULL DEFAULT ''",
         "discovery_contract": "TEXT",
@@ -259,7 +275,7 @@ def _row_dict(row: sqlite3.Row | None) -> Optional[dict[str, Any]]:
             out["last_gate_result"] = {"ok": False, "error": "invalid stored gate result"}
     for name in (
         "last_ranking", "last_publish_result", "selected_improvement",
-        "initial_snapshot", "authenticated_snapshot",
+        "initial_snapshot", "authenticated_snapshot", "source_snapshot",
     ):
         raw = out.get(name)
         if raw:
@@ -401,6 +417,20 @@ def _validate_create(
         raise ValueError("max_repairs must be between 0 and 20")
     build_command = str(data.get("build_command") or "").strip()
     test_command = str(data.get("test_command") or "").strip()
+    isolation_mode = str(data.get("isolation_mode") or "workspace").strip().lower()
+    if isolation_mode not in {"workspace", "podman"}:
+        raise ValueError("isolation_mode must be 'workspace' or 'podman'")
+    container_image = str(data.get("container_image") or "").strip() or None
+    container_network = str(data.get("container_network") or "none").strip().lower()
+    if isolation_mode == "podman":
+        if not container_image or not re.fullmatch(
+            r"[^\s@]+@sha256:[0-9a-f]{64}", container_image
+        ):
+            raise ValueError("Podman isolation requires an image pinned by sha256 digest")
+        if container_network not in {"none", "slirp4netns"}:
+            raise ValueError("container_network must be 'none' or 'slirp4netns'")
+    elif container_image is not None:
+        raise ValueError("container_image is only valid with Podman isolation")
 
     gate_timeout_seconds = int(data.get("gate_timeout_seconds") or 900)
     if not 10 <= gate_timeout_seconds <= 3600:
@@ -435,6 +465,9 @@ def _validate_create(
         "provider_override": (str(data.get("provider_override") or "").strip() or None),
         "build_command": build_command,
         "test_command": test_command,
+        "isolation_mode": isolation_mode,
+        "container_image": container_image,
+        "container_network": container_network,
         "gate_timeout_seconds": gate_timeout_seconds,
         "target_average": target_average,
         "publish_on_success": publish_on_success,
@@ -447,27 +480,150 @@ def _validate_create(
     }
 
 
+def _system_podman() -> str:
+    for candidate in (Path("/usr/bin/podman"), Path("/bin/podman"), Path("/usr/local/bin/podman")):
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return str(resolved)
+    raise RuntimeError("trusted system Podman executable is unavailable")
+
+
+def _podman_command(*args: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    for key in tuple(env):
+        if key.startswith(("CONTAINER_", "CONTAINERS_", "PODMAN_", "DOCKER_")):
+            env.pop(key, None)
+    env["PATH"] = "/usr/bin:/bin"
+    return subprocess.run(
+        [_system_podman(), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+        env=env,
+    )
+
+
+def _remove_podman_volume(volume: str) -> bool:
+    if not re.fullmatch(r"hermes-quality-loop-[a-f0-9]{12}", volume):
+        return False
+    try:
+        removed = _podman_command("volume", "rm", "--force", volume, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return removed.returncode == 0
+
+
+def _require_podman_volume_removed(volume: str, *, context: str) -> None:
+    if not _remove_podman_volume(volume):
+        raise RuntimeError(f"{context}; could not remove campaign Podman volume {volume}")
+
+
+def _prepare_podman_workspace(
+    campaign_id: str, source: Path, source_head: str, image: str,
+) -> tuple[Path, str, str]:
+    rootless = _podman_command("info", "--format", "{{.Host.Security.Rootless}}", timeout=60)
+    if rootless.returncode != 0 or rootless.stdout.strip().lower() != "true":
+        raise RuntimeError("Podman campaign isolation requires rootless Podman")
+    inspected = _podman_command("image", "inspect", "--format", "{{.Id}}", image, timeout=120)
+    image_id = inspected.stdout.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", image_id):
+        image_id = "sha256:" + image_id
+    if inspected.returncode != 0 or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise RuntimeError("pinned campaign image is not available in rootless Podman storage")
+
+    volume = "hermes-quality-loop-" + campaign_id.removeprefix("ql_")
+    try:
+        created = _podman_command(
+            "volume", "create", "--label", f"io.hermes.quality-loop.campaign={campaign_id}", volume,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        try:
+            _require_podman_volume_removed(
+                volume, context="campaign Podman volume creation did not complete"
+            )
+        except RuntimeError as cleanup_error:
+            raise cleanup_error from exc
+        raise RuntimeError("campaign Podman volume creation timed out; cleanup verified") from exc
+    if created.returncode != 0 or created.stdout.strip() != volume:
+        failure = RuntimeError("could not create the campaign Podman volume")
+        try:
+            _require_podman_volume_removed(volume, context=str(failure))
+        except RuntimeError as cleanup_error:
+            raise cleanup_error from failure
+        raise failure
+    try:
+        mounted = _podman_command(
+            "volume", "inspect", "--format", "{{.Mountpoint}}", volume, timeout=120
+        )
+        if mounted.returncode != 0:
+            raise RuntimeError("could not resolve the campaign Podman volume")
+        mountpoint = Path(mounted.stdout.strip()).resolve(strict=True)
+        if not mountpoint.is_dir() or not mountpoint.is_absolute():
+            raise RuntimeError("campaign Podman volume has an invalid mount point")
+        repository = mountpoint / "repository"
+        cloned = _git_command(
+            str(mountpoint),
+            "-c", "core.hooksPath=/dev/null",
+            "clone", "--no-local", "--no-hardlinks", "--no-tags", "--no-checkout",
+            "--", str(source), str(repository),
+            timeout=600,
+        )
+        if cloned.returncode != 0:
+            raise RuntimeError("could not clone the source into the campaign Podman volume")
+        checked_out = _git_without_hooks(
+            str(repository), "checkout", "--detach", source_head, timeout=300
+        )
+        if checked_out.returncode != 0:
+            raise RuntimeError("could not check out the authenticated source commit")
+        removed_remote = _git_without_hooks(str(repository), "remote", "remove", "origin")
+        if removed_remote.returncode != 0:
+            raise RuntimeError("could not disconnect the isolated checkout from its source")
+        return repository.resolve(strict=True), volume, image_id
+    except Exception as exc:
+        try:
+            _require_podman_volume_removed(
+                volume, context="isolated campaign workspace preparation failed"
+            )
+        except RuntimeError as cleanup_error:
+            raise cleanup_error from exc
+        raise
+
+
 def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
     _require_controller_task_api()
     requested_workspace = Path(str(data.get("workspace") or "")).expanduser()
     if not requested_workspace.is_absolute():
         raise ValueError("workspace must be an absolute path")
-    canonical_workspace = requested_workspace.resolve(strict=True)
-    root_fd = _open_workspace_root(canonical_workspace)
+    source_workspace = requested_workspace.resolve(strict=True)
+    root_fd = _open_workspace_root(source_workspace)
     try:
-        with _pinned_git_context(canonical_workspace, root_fd):
+        with _pinned_git_context(source_workspace, root_fd):
             clean = _validate_create(
-                data, root_fd=root_fd, pinned_workspace=canonical_workspace
+                data, root_fd=root_fd, pinned_workspace=source_workspace
             )
-            initial_snapshot = _execution_git_state_with_root(
-                canonical_workspace, None, root_fd
+            source_snapshot = _execution_git_state_with_root(
+                source_workspace, None, root_fd
+            )
+            source_context = _current_git_context(root_fd)
+            assert source_context is not None
+            _source_head, source_head_ref = _pinned_head(source_context)
+            source_branch = (
+                source_head_ref[len("refs/heads/"):]
+                if source_head_ref and source_head_ref.startswith("refs/heads/")
+                else None
             )
             discovery_contract = (
                 None
                 if clean["build_command"] or clean["test_command"]
-                else _discover_project_contract(canonical_workspace, root_fd)
+                else _discover_project_contract(source_workspace, root_fd)
             )
-            if not _workspace_root_handle_matches(root_fd, canonical_workspace):
+            if not _workspace_root_handle_matches(root_fd, source_workspace):
                 raise ValueError("workspace root changed during campaign creation")
     finally:
         os.close(root_fd)
@@ -475,16 +631,59 @@ def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
     board_conn = kbc.connect(board=clean["board"])
     board_conn.close()
     campaign_id = "ql_" + uuid.uuid4().hex[:12]
+    podman_volume: str | None = None
+    if clean["isolation_mode"] == "podman":
+        isolated_workspace, podman_volume, image_id = _prepare_podman_workspace(
+            campaign_id,
+            source_workspace,
+            str(source_snapshot["head"]),
+            str(clean["container_image"]),
+        )
+        try:
+            clean.update(
+                source_workspace=str(source_workspace),
+                source_snapshot=json.dumps(source_snapshot, sort_keys=True),
+                source_branch=source_branch,
+                workspace=str(isolated_workspace),
+                podman_volume=podman_volume,
+                container_image_id=image_id,
+            )
+            isolated_fd = _open_workspace_root(isolated_workspace)
+            try:
+                with _pinned_git_context(isolated_workspace, isolated_fd):
+                    initial_snapshot = _execution_git_state_with_root(
+                        isolated_workspace, None, isolated_fd
+                    )
+            finally:
+                os.close(isolated_fd)
+        except Exception as exc:
+            try:
+                _require_podman_volume_removed(
+                    podman_volume, context="isolated campaign snapshot failed"
+                )
+            except RuntimeError as cleanup_error:
+                raise cleanup_error from exc
+            raise
+    else:
+        clean.update(
+            source_workspace=None,
+            source_snapshot=None,
+            source_branch=None,
+            podman_volume=None,
+            container_image_id=None,
+        )
+        initial_snapshot = source_snapshot
     now = int(time.time())
-    conn = _conn()
+    conn: sqlite3.Connection | None = None
     try:
+        conn = _conn()
         conn.execute("BEGIN IMMEDIATE")
         terminal_states = sorted(TERMINAL_STATES)
         placeholders = ", ".join("?" for _ in terminal_states)
         duplicate = conn.execute(
-            "SELECT id FROM campaigns WHERE board = ? AND workspace = ? "
+            "SELECT id FROM campaigns WHERE board = ? AND COALESCE(source_workspace, workspace) = ? "
             f"AND state NOT IN ({placeholders}) LIMIT 1",
-            (clean["board"], clean["workspace"], *terminal_states),
+            (clean["board"], str(source_workspace), *terminal_states),
         ).fetchone()
         if duplicate:
             raise ValueError(
@@ -493,7 +692,9 @@ def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
         conn.execute(
             """
             INSERT INTO campaigns (
-                id, name, board, workspace, assignee,
+                id, name, board, workspace, source_workspace, source_snapshot, source_branch,
+                isolation_mode,
+                podman_volume, container_image, container_image_id, container_network, assignee,
                 examiner_model, executor_model, validator_model, provider_override,
                 build_command, test_command, discovery_contract, gate_timeout_seconds,
                 target_average, publish_on_success, publish_remote, publish_branch, commit_message,
@@ -502,7 +703,9 @@ def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
                 state, stage, round_no, repair_no, max_rounds, max_repairs,
                 created_at, updated_at, message
             ) VALUES (
-                :id, :name, :board, :workspace, :assignee,
+                :id, :name, :board, :workspace, :source_workspace, :source_snapshot, :source_branch,
+                :isolation_mode,
+                :podman_volume, :container_image, :container_image_id, :container_network, :assignee,
                 :examiner_model, :executor_model, :validator_model, :provider_override,
                 :build_command, :test_command, :discovery_contract, :gate_timeout_seconds,
                 :target_average, :publish_on_success, :publish_remote, :publish_branch, :commit_message,
@@ -533,11 +736,20 @@ def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
             },
         )
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        if podman_volume:
+            try:
+                _require_podman_volume_removed(
+                    podman_volume, context="campaign database initialization failed"
+                )
+            except RuntimeError as cleanup_error:
+                raise cleanup_error from exc
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     try:
         reconcile_campaign(campaign_id)
     except Exception as exc:
@@ -3829,10 +4041,46 @@ def _runtime_artifact_path(path: str) -> bool:
     )
 
 
+def _podman_publication_remote(c: dict[str, Any]) -> str:
+    source_text = str(c.get("source_workspace") or "")
+    expected = c.get("source_snapshot")
+    if not source_text or not isinstance(expected, dict):
+        raise RuntimeError("missing authenticated Podman campaign source")
+    source = Path(source_text).resolve(strict=True)
+    root_fd = _open_workspace_root(source)
+    try:
+        with _pinned_git_context(source, root_fd):
+            current = _execution_git_state_with_root(source, None, root_fd)
+            if current != expected:
+                raise RuntimeError("source workspace changed since the isolated campaign was created")
+            remote = str(c.get("publish_remote") or "origin").strip()
+            context = _current_git_context(root_fd)
+            assert context is not None
+            resolved = _pinned_config_command(context, "--get", f"remote.{remote}.url")
+            if resolved.returncode != 0:
+                raise RuntimeError(f"source Git remote {remote!r} does not exist")
+            unsafe = _unsafe_publication_git_config(source_text, root_fd=root_fd)
+            if unsafe:
+                raise RuntimeError(
+                    "refusing source-controlled executable Git configuration: "
+                    + ", ".join(unsafe)
+                )
+            return _safe_publication_remote_url(source_text, resolved.stdout)
+    finally:
+        os.close(root_fd)
+
+
 def _publish_success(c: dict[str, Any]) -> dict[str, Any]:
     """Commit and push only after final model validation and hard gates passed."""
     workspace = str(c["workspace"])
     failure: dict[str, Any] = {"ok": False, "committed": False, "pushed": False}
+    publication = c
+    if c.get("isolation_mode") == "podman":
+        try:
+            publication = dict(c, _publication_remote_url=_podman_publication_remote(c))
+        except (OSError, RuntimeError, ValueError) as exc:
+            failure["error"] = f"could not authenticate Podman campaign source: {exc}"
+            return failure
     try:
         root_fd = _open_workspace_root(Path(workspace))
     except (OSError, RuntimeError) as exc:
@@ -3841,7 +4089,7 @@ def _publish_success(c: dict[str, Any]) -> dict[str, Any]:
     try:
         try:
             with _pinned_git_context(Path(workspace), root_fd):
-                result = _publish_success_with_root(c, root_fd)
+                result = _publish_success_with_root(publication, root_fd)
                 if (
                     not result.get("pushed")
                     and not _workspace_root_handle_matches(root_fd, Path(workspace))
@@ -3925,7 +4173,7 @@ def _publish_success_with_root(c: dict[str, Any], root_fd: int) -> dict[str, Any
         result["error"] = "workspace is not the root of a Git worktree"
         return result
 
-    branch = str(c.get("publish_branch") or "").strip()
+    branch = str(c.get("publish_branch") or c.get("source_branch") or "").strip()
     if not branch:
         context = _current_git_context(root_fd)
         assert context is not None
@@ -3942,10 +4190,6 @@ def _publish_success_with_root(c: dict[str, Any], root_fd: int) -> dict[str, Any
     remote = str(c.get("publish_remote") or "origin").strip()
     context = _current_git_context(root_fd)
     assert context is not None
-    resolved_remote = _pinned_config_command(context, "--get", f"remote.{remote}.url")
-    if resolved_remote.returncode != 0:
-        result["error"] = f"Git remote {remote!r} does not exist"
-        return result
     try:
         unsafe_config = _unsafe_publication_git_config(workspace, root_fd=root_fd)
     except RuntimeError as exc:
@@ -3962,11 +4206,17 @@ def _publish_success_with_root(c: dict[str, Any], root_fd: int) -> dict[str, Any
     if not context.matches():
         result["error"] = "Git control state changed during publication preflight"
         return result
-    try:
-        remote_url = _safe_publication_remote_url(workspace, resolved_remote.stdout)
-    except ValueError as exc:
-        result["error"] = f"unsafe publication configuration: {exc}"
-        return result
+    remote_url = str(c.get("_publication_remote_url") or "").strip()
+    if not remote_url:
+        resolved_remote = _pinned_config_command(context, "--get", f"remote.{remote}.url")
+        if resolved_remote.returncode != 0:
+            result["error"] = f"Git remote {remote!r} does not exist"
+            return result
+        try:
+            remote_url = _safe_publication_remote_url(workspace, resolved_remote.stdout)
+        except ValueError as exc:
+            result["error"] = f"unsafe publication configuration: {exc}"
+            return result
 
     base_revision_text = _pinned_head_oid(root_fd)
     try:
@@ -4108,6 +4358,62 @@ def _publish_success_with_root(c: dict[str, Any], root_fd: int) -> dict[str, Any
     return result
 
 
+def _run_podman_gate(
+    c: dict[str, Any], name: str, command: str, timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    volume = str(c.get("podman_volume") or "")
+    image_id = str(c.get("container_image_id") or "")
+    if not re.fullmatch(r"hermes-quality-loop-[a-f0-9]{12}", volume):
+        raise RuntimeError("campaign Podman volume is missing or malformed")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise RuntimeError("campaign Podman image identity is missing or malformed")
+    network = str(c.get("container_network") or "none")
+    if network not in {"none", "slirp4netns"}:
+        raise RuntimeError("campaign Podman network policy is invalid")
+    container_name = f"{volume}-{name}-{uuid.uuid4().hex[:8]}"
+    try:
+        return _podman_command(
+            "run",
+            "--rm",
+            f"--name={container_name}",
+            f"--network={network}",
+            "--pull=never",
+            "--entrypoint=/bin/sh",
+            "--cap-drop=all",
+            "--security-opt",
+            "no-new-privileges",
+            "--userns=keep-id",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev,size=512m",
+            "--env",
+            "HOME=/tmp",
+            "--pids-limit=512",
+            "--memory=4g",
+            "--cpus=2",
+            "--volume",
+            f"{volume}:/workspace:rw",
+            "--workdir",
+            "/workspace/repository",
+            image_id,
+            "-lc",
+            command,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        try:
+            removed = _podman_command("rm", "--force", container_name, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+            raise RuntimeError(
+                "could not stop timed-out Podman gate container; campaign requires review"
+            ) from cleanup_error
+        if removed.returncode != 0:
+            raise RuntimeError(
+                "could not stop timed-out Podman gate container; campaign requires review"
+            ) from exc
+        raise
+
+
 def _run_gates(c: dict[str, Any]) -> dict[str, Any]:
     """Run fixed user-configured gates without asking an LLM for the outcome."""
     results: list[dict[str, Any]] = []
@@ -4118,16 +4424,19 @@ def _run_gates(c: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
         item: dict[str, Any] = {"name": name, "command": command}
         try:
-            completed = subprocess.run(
-                command,
-                cwd=c["workspace"],
-                shell=True,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-                check=False,
-            )
+            if c.get("isolation_mode") == "podman":
+                completed = _run_podman_gate(c, name, str(command), timeout)
+            else:
+                completed = subprocess.run(
+                    command,
+                    cwd=c["workspace"],
+                    shell=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                    check=False,
+                )
             item.update(
                 exit_code=completed.returncode,
                 timed_out=False,
@@ -4138,6 +4447,16 @@ def _run_gates(c: dict[str, Any]) -> dict[str, Any]:
             if isinstance(output, bytes):
                 output = output.decode(errors="replace")
             item.update(exit_code=None, timed_out=True, output=str(output)[-8000:])
+        except RuntimeError as exc:
+            item.update(exit_code=None, timed_out=False, output="")
+            item["duration_seconds"] = round(time.monotonic() - started, 3)
+            results.append(item)
+            return {
+                "ok": False,
+                "fatal_error": str(exc),
+                "commands": results,
+                "checked_at": int(time.time()),
+            }
         item["duration_seconds"] = round(time.monotonic() - started, 3)
         results.append(item)
         if item.get("exit_code") != 0 or item.get("timed_out"):
@@ -4645,6 +4964,13 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                 "skipped": "validator did not satisfy model-reviewed gates",
             }
             _update(campaign_id, last_gate_result=json.dumps(gate_result, sort_keys=True))
+            if gate_result.get("fatal_error"):
+                _pause(
+                    c,
+                    "Hard-gate isolation failure: " + str(gate_result["fatal_error"]),
+                    run_id=run.id if run else None,
+                )
+                return get_campaign(campaign_id)
 
             if model_claims_pass and not _read_only_snapshot_unchanged(c, str(task.body or "")):
                 _pause(

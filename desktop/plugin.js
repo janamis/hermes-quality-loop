@@ -220,7 +220,7 @@ function CampaignCard({ campaign }) {
               jsx(Stat, { label: 'Round', value: `${campaign.round_no}/${campaign.max_rounds}` }),
               jsx(Stat, { label: 'Stage', value: campaign.stage }),
               jsx(Stat, { label: 'Repair', value: `${campaign.repair_no}/${campaign.max_repairs}` }),
-              jsx(Stat, { label: 'Workspace', value: campaign.workspace })
+              jsx(Stat, { label: 'Isolation', value: campaign.isolation_mode === 'podman' ? 'Podman volume' : 'Direct workspace' })
             ]
           }),
           task
@@ -295,6 +295,9 @@ function CreateCampaign() {
   const [provider, setProvider] = useState('')
   const [buildCommand, setBuildCommand] = useState('')
   const [testCommand, setTestCommand] = useState('')
+  const [isolationMode, setIsolationMode] = useState('podman')
+  const [containerImage, setContainerImage] = useState('')
+  const [containerNetwork, setContainerNetwork] = useState('none')
   const [gateTimeout, setGateTimeout] = useState('900')
   const [rounds, setRounds] = useState('20')
   const [repairs, setRepairs] = useState('3')
@@ -417,7 +420,8 @@ function CreateCampaign() {
   const missing = [
     !workspace.trim() ? 'workspace' : '',
     !assignee.trim() ? 'profile' : '',
-    !examiner.trim() || !executor.trim() || !validator.trim() ? 'models' : ''
+    !examiner.trim() || !executor.trim() || !validator.trim() ? 'models' : '',
+    isolationMode === 'podman' && !containerImage.trim() ? 'pinned container image' : ''
   ].filter(Boolean)
 
   const create = useMutation({
@@ -433,6 +437,9 @@ function CreateCampaign() {
         provider_override: providerOverride,
         build_command: buildCommand,
         test_command: testCommand,
+        isolation_mode: isolationMode,
+        container_image: isolationMode === 'podman' ? containerImage : null,
+        container_network: containerNetwork,
         gate_timeout_seconds: Number(gateTimeout),
         target_average: targetAverage === '' ? null : Number(targetAverage),
         prompt_profile: promptProfile,
@@ -529,6 +536,48 @@ function CreateCampaign() {
                       ]
                     })
                   }),
+                  jsx(Field, {
+                    label: 'Workspace isolation',
+                    className: 'md:col-span-2',
+                    hint: 'Podman volume checkout keeps campaign files out of the source workspace and runs hard gates in disposable containers.',
+                    children: jsx(PickerWithContent, {
+                      value: isolationMode,
+                      onChange: setIsolationMode,
+                      items: [
+                        { value: 'podman', label: 'Podman volume checkout · recommended' },
+                        { value: 'workspace', label: 'Direct workspace · legacy' }
+                      ],
+                      placeholder: 'Choose isolation',
+                      ariaLabel: 'Workspace isolation'
+                    })
+                  }),
+                  isolationMode === 'podman'
+                    ? jsxs('div', {
+                        className: 'grid gap-3 md:col-span-2 md:grid-cols-2',
+                        children: [
+                          jsx(Field, {
+                            label: 'Pinned container image',
+                            required: true,
+                            hint: 'The image must already exist in rootless Podman and include /bin/sh plus project build tools.',
+                            children: jsx(Input, { value: containerImage, onChange: input(setContainerImage), placeholder: 'registry.example/image@sha256:…' })
+                          }),
+                          jsx(Field, {
+                            label: 'Container network',
+                            hint: 'Keep disabled unless a gate must fetch dependencies.',
+                            children: jsx(PickerWithContent, {
+                              value: containerNetwork,
+                              onChange: setContainerNetwork,
+                              items: [
+                                { value: 'none', label: 'None · recommended' },
+                                { value: 'slirp4netns', label: 'Rootless outbound network' }
+                              ],
+                              placeholder: 'Choose network policy',
+                              ariaLabel: 'Container network'
+                            })
+                          })
+                        ]
+                      })
+                    : null,
                   jsx(Field, {
                     label: 'Hermes assignee profile',
                     required: true,

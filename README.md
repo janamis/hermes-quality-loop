@@ -32,6 +32,8 @@ The controller registers `on_kanban_dispatch_tick` and never calls an LLM itself
 - Hermes Agent 0.21.3 or newer
 - Hermes controller-owned Kanban task capability (`hermes_cli.kanban_db_controller`)
 - Hermes Kanban enabled
+- Rootless Podman 5 or newer on local Linux for the recommended isolated mode; remote Podman
+  connections and Podman-machine mount paths are intentionally unsupported
 - One configured Hermes worker profile
 - Three model names that the profile's provider can route
 - An existing Git worktree or repository with at least one deterministic build or test command
@@ -56,7 +58,9 @@ Then enable `quality-loop` for the profile you use with Hermes Desktop.
 
 Open **Capabilities → Plugins**, enable **Quality Loop**, and use the new sidebar page. Enter:
 
-- an existing project or worktree selected with the native folder browser, or entered as an absolute path;
+- a clean existing project selected with the native folder browser, or entered as an absolute path;
+- **Podman volume checkout** (recommended) plus a locally available image pinned as
+  `registry/image@sha256:...`; the image must provide `/bin/sh` and the project's build tools;
 - the assignee profile from the live Hermes profile picker;
 - one shared provider and separate examination, execution, and validation models from that profile's live model catalog;
 - at least one fixed build or test command;
@@ -68,16 +72,38 @@ incomplete live response from the profile's non-secret model cache, keeps
 provider-specific offline fallbacks, and permits manual IDs when no catalog is available.
 Model and profile fields intentionally have no machine-specific defaults.
 
-The configured build and test commands are deliberately executed by the
-system shell in the selected workspace, with the same permissions as Hermes.
-Only enter commands you trust and inspect the target repository before starting
-a campaign.
+In Podman mode, the controller authenticates the source commit, creates a rootless
+Podman volume, clones that exact commit into `repository/` in the volume, removes the
+clone's `origin`, and points Kanban cards at that campaign checkout. The original source
+workspace is never mounted into gate containers. Build and test gates run by local image
+ID in disposable containers with all capabilities dropped, `no-new-privileges`, bounded
+CPU/memory/PIDs, and no network by default. Select rootless outbound networking only for
+gates that must fetch dependencies.
+
+The Hermes Kanban worker itself still runs under the selected Hermes profile on the host;
+Podman mode isolates campaign repository bytes and hard-gate execution, but is not a
+general sandbox for every tool the model can call. Keep the worker profile's tool policy
+least-privileged and do not expose the source workspace in card instructions.
+
+Legacy direct-workspace mode executes build and test commands through the system shell
+with the same permissions as Hermes. Only enter commands you trust.
 
 ## Publication and safety
 
 Use a dedicated branch or worktree. By default, Quality Loop does **not** commit, push, merge, or deploy changes.
 
-When **Publish after final PASS** is explicitly enabled, the controller may stage repository changes, create one commit, and push the selected branch to the selected remote after the target score and final validation gates pass. Before committing, it rejects common credential/key paths and scans the staged diff for private keys and common API-token patterns. This screening is defense in depth, not a substitute for reviewing the branch and its diff.
+When **Publish after final PASS** is explicitly enabled, the controller constructs one
+commit from the authenticated campaign bytes and pushes that exact commit to the selected
+remote after the target score and final validation gates pass. In Podman mode it reads the
+remote from the unchanged, re-authenticated source checkout; the isolated checkout has no
+remote and receives no host Git credentials. The source checkout is not modified or
+fast-forwarded. Before committing, the controller rejects common credential/key paths and
+scans the diff for private keys and common API-token patterns. This screening is defense
+in depth, not a substitute for reviewing the branch and its diff.
+
+Campaign volumes are retained when a campaign stops or finishes so results remain
+inspectable. Remove a terminal campaign's named `hermes-quality-loop-<id>` volume manually
+after preserving anything needed for review.
 
 Quality Loop never merges or deploys changes.
 

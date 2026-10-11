@@ -42,6 +42,11 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertIn("SelectTrigger", source)
         self.assertIn("SelectItem", source)
         self.assertIn("onCheckedChange: setPublishOnSuccess", source)
+        self.assertIn("const [isolationMode, setIsolationMode] = useState('podman')", source)
+        self.assertIn("isolation_mode: isolationMode", source)
+        self.assertIn("container_image: isolationMode === 'podman' ? containerImage : null", source)
+        self.assertIn("container_network: containerNetwork", source)
+        self.assertIn("Podman volume checkout", source)
         self.assertNotIn("useState('qwen3.5:122b-a10b')", source)
         self.assertNotIn("useState('glm-4.7-flash:q4_K_M')", source)
 
@@ -97,6 +102,10 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertEqual(sys.path, before)
         self.assertEqual(api.controller.__name__, "hermes_quality_loop_controller")
         self.assertIs(sys.modules["hermes_quality_loop_controller"], api.controller)
+        self.assertEqual(
+            api.CampaignCreate.model_fields["isolation_mode"].default, "workspace"
+        )
+        self.assertIsNone(api.CampaignCreate.model_fields["container_image"].default)
 
     def test_dashboard_api_reads_cached_profile_model_catalog(self):
         api_spec = importlib.util.spec_from_file_location(
