@@ -523,8 +523,31 @@ def _require_podman_volume_removed(volume: str, *, context: str) -> None:
         raise RuntimeError(f"{context}; could not remove campaign Podman volume {volume}")
 
 
+@contextmanager
+def _podman_clone_git_config(source: Path, git_dir: Path) -> Iterator[Path]:
+    """Create a protected Git config that permits only the authenticated local source."""
+    safe_paths = tuple(dict.fromkeys((source, git_dir)))
+    for safe_path in safe_paths:
+        value = str(safe_path)
+        if value == "*" or value.endswith("/*"):
+            raise RuntimeError("authenticated Git path has unsafe safe.directory wildcard semantics")
+    with tempfile.TemporaryDirectory(prefix="quality-loop-clone-config-") as directory:
+        config = Path(directory) / "gitconfig"
+        config.touch(mode=0o600)
+        for safe_path in safe_paths:
+            configured = _git_command(
+                directory,
+                "config", "--file", str(config), "--add", "safe.directory", str(safe_path),
+                timeout=30,
+            )
+            if configured.returncode != 0:
+                raise RuntimeError("could not create protected Git clone configuration")
+        yield config
+
+
 def _prepare_podman_workspace(
     campaign_id: str, source: Path, source_head: str, image: str,
+    source_git_dir: Optional[Path] = None,
 ) -> tuple[Path, str, str]:
     rootless = _podman_command("info", "--format", "{{.Host.Security.Rootless}}", timeout=60)
     if rootless.returncode != 0 or rootless.stdout.strip().lower() != "true":
@@ -567,13 +590,15 @@ def _prepare_podman_workspace(
         if not mountpoint.is_dir() or not mountpoint.is_absolute():
             raise RuntimeError("campaign Podman volume has an invalid mount point")
         repository = mountpoint / "repository"
-        cloned = _git_command(
-            str(mountpoint),
-            "-c", "core.hooksPath=/dev/null",
-            "clone", "--no-local", "--no-hardlinks", "--no-tags", "--no-checkout",
-            "--", str(source), str(repository),
-            timeout=600,
-        )
+        clone_git_dir = source_git_dir or source / ".git"
+        with _podman_clone_git_config(source, clone_git_dir) as clone_config:
+            cloned = _git_without_hooks(
+                str(mountpoint),
+                "clone", "--no-local", "--no-hardlinks", "--no-tags", "--no-checkout",
+                "--", str(source), str(repository),
+                timeout=600,
+                trusted_global_config=str(clone_config),
+            )
         if cloned.returncode != 0:
             raise RuntimeError("could not clone the source into the campaign Podman volume")
         checked_out = _git_without_hooks(
@@ -612,6 +637,7 @@ def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
             )
             source_context = _current_git_context(root_fd)
             assert source_context is not None
+            source_git_dir = source_context.git_path
             _source_head, source_head_ref = _pinned_head(source_context)
             source_branch = (
                 source_head_ref[len("refs/heads/"):]
@@ -638,6 +664,7 @@ def create_campaign(data: dict[str, Any]) -> dict[str, Any]:
             source_workspace,
             str(source_snapshot["head"]),
             str(clean["container_image"]),
+            source_git_dir,
         )
         try:
             clean.update(
@@ -3617,6 +3644,7 @@ def _git_command(
     env: Optional[dict[str, str]] = None,
     input_data: Optional[bytes] = None,
     root_fd: Optional[int] = None,
+    trusted_global_config: Optional[str] = None,
 ) -> subprocess.CompletedProcess[str]:
     command_env = dict(os.environ) if env is None else dict(env)
     if env is None:
@@ -3633,7 +3661,7 @@ def _git_command(
                 command_env.pop(key, None)
     command_env["GIT_NO_REPLACE_OBJECTS"] = "1"
     command_env["GIT_CONFIG_NOSYSTEM"] = "1"
-    command_env["GIT_CONFIG_GLOBAL"] = os.devnull
+    command_env["GIT_CONFIG_GLOBAL"] = trusted_global_config or os.devnull
     command = [_system_git(), *args]
     cwd = workspace if root_fd is None else _workspace_fd_path(root_fd)
     pass_fds: tuple[int, ...] = () if root_fd is None else (root_fd,)
@@ -3674,6 +3702,7 @@ def _git_without_hooks(
     env_overrides: Optional[dict[str, str]] = None,
     input_data: Optional[bytes] = None,
     root_fd: Optional[int] = None,
+    trusted_global_config: Optional[str] = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run Git with hooks, signing, helpers, prompts, and injected config disabled."""
     env = dict(os.environ)
@@ -3716,6 +3745,7 @@ def _git_without_hooks(
             env=env,
             input_data=input_data,
             root_fd=root_fd,
+            trusted_global_config=trusted_global_config,
         )
 
 

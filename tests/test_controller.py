@@ -231,6 +231,173 @@ else:
         assert task is not None
         self.assertEqual(task.workspace_path, str(isolated))
 
+    def test_podman_clone_git_config_rejects_safe_directory_wildcards(self):
+        cases = (
+            (Path("/authenticated/*"), Path("/authenticated/repository/.git")),
+            (Path("/authenticated/repository"), Path("/authenticated/worktrees/*")),
+        )
+        for source, git_dir in cases:
+            with self.subTest(source=source, git_dir=git_dir):
+                with self.assertRaisesRegex(RuntimeError, "wildcard"):
+                    with controller._podman_clone_git_config(source, git_dir):
+                        self.fail("unsafe config was yielded")
+
+    def test_git_command_rejects_untrusted_global_config_from_explicit_env(self):
+        completed = subprocess.CompletedProcess([], 0, "", None)
+        with (
+            mock.patch.object(controller, "_system_git", return_value="/usr/bin/git"),
+            mock.patch.object(controller.subprocess, "run", return_value=completed) as run,
+        ):
+            controller._git_command(
+                str(self.workspace),
+                "status",
+                env={"GIT_CONFIG_GLOBAL": "/tmp/untrusted-gitconfig"},
+            )
+        self.assertEqual(run.call_args.kwargs["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
+
+    def test_podman_checkout_uses_protected_safe_directory_config(self):
+        executable, volume_root, log = self.fake_podman()
+        head = subprocess.run(
+            ["git", "-C", str(self.workspace), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        real_run = subprocess.run
+        observed: list[dict[str, object]] = []
+        later_git_configs: list[str] = []
+
+        def capture_final_git_environment(*args, **kwargs):
+            command = args[0]
+            if isinstance(command, list) and command and Path(command[0]).name == "git":
+                if "clone" in command:
+                    config_path = Path(kwargs["env"]["GIT_CONFIG_GLOBAL"])
+                    names = real_run(
+                        ["git", "config", "--file", str(config_path), "--name-only", "--list"],
+                        check=True, capture_output=True, text=True,
+                    ).stdout.splitlines()
+                    values = real_run(
+                        ["git", "config", "--file", str(config_path), "--get-all", "safe.directory"],
+                        check=True, capture_output=True, text=True,
+                    ).stdout.splitlines()
+                    observed.append({
+                        "path": config_path,
+                        "mode": stat.S_IMODE(config_path.stat().st_mode),
+                        "names": names,
+                        "values": values,
+                    })
+                elif "checkout" in command or "remote" in command:
+                    later_git_configs.append(kwargs["env"]["GIT_CONFIG_GLOBAL"])
+            return real_run(*args, **kwargs)
+
+        volume = None
+        with (
+            mock.patch.object(controller, "_system_podman", return_value=str(executable)),
+            mock.patch.object(controller.subprocess, "run", side_effect=capture_final_git_environment),
+            mock.patch.dict(
+                os.environ,
+                {"FAKE_PODMAN_ROOT": str(volume_root), "FAKE_PODMAN_LOG": str(log)},
+            ),
+        ):
+            try:
+                _workspace, volume, _image_id = controller._prepare_podman_workspace(
+                    "ql_abcdef123456",
+                    self.workspace,
+                    head,
+                    "example.invalid/quality-loop@sha256:" + "b" * 64,
+                )
+            finally:
+                if volume:
+                    controller._remove_podman_volume(volume)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["mode"], 0o600)
+        self.assertEqual(observed[0]["names"], ["safe.directory", "safe.directory"])
+        self.assertEqual(
+            observed[0]["values"],
+            [str(self.workspace), str(self.workspace / ".git")],
+        )
+        self.assertTrue(later_git_configs)
+        self.assertEqual(set(later_git_configs), {os.devnull})
+        self.assertFalse(Path(str(observed[0]["path"])).exists())
+
+    def test_podman_checkout_deletes_protected_config_after_failed_clone(self):
+        executable, volume_root, log = self.fake_podman()
+        head = subprocess.run(
+            ["git", "-C", str(self.workspace), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        real_run = subprocess.run
+        observed_paths: list[Path] = []
+
+        def fail_clone(*args, **kwargs):
+            command = args[0]
+            if isinstance(command, list) and command and Path(command[0]).name == "git" and "clone" in command:
+                observed_paths.append(Path(kwargs["env"]["GIT_CONFIG_GLOBAL"]))
+                return subprocess.CompletedProcess(command, 128, "", "rejected")
+            return real_run(*args, **kwargs)
+
+        with (
+            mock.patch.object(controller, "_system_podman", return_value=str(executable)),
+            mock.patch.object(controller.subprocess, "run", side_effect=fail_clone),
+            mock.patch.dict(
+                os.environ,
+                {"FAKE_PODMAN_ROOT": str(volume_root), "FAKE_PODMAN_LOG": str(log)},
+            ),
+            self.assertRaisesRegex(RuntimeError, "could not clone"),
+        ):
+            controller._prepare_podman_workspace(
+                "ql_abcdef123456",
+                self.workspace,
+                head,
+                "example.invalid/quality-loop@sha256:" + "b" * 64,
+            )
+        self.assertEqual(len(observed_paths), 1)
+        self.assertFalse(observed_paths[0].exists())
+
+    def test_podman_campaign_trusts_linked_worktree_administrative_git_dir(self):
+        executable, volume_root, log = self.fake_podman()
+        linked = Path(self.temp.name) / "linked-worktree"
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "worktree", "add", "--detach", str(linked)],
+            check=True, capture_output=True, text=True,
+        )
+        linked_git_dir = Path(subprocess.run(
+            ["git", "-C", str(linked), "rev-parse", "--absolute-git-dir"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip())
+        real_run = subprocess.run
+        observed_values: list[list[str]] = []
+
+        def capture_clone_config(*args, **kwargs):
+            command = args[0]
+            if isinstance(command, list) and command and Path(command[0]).name == "git" and "clone" in command:
+                config_path = kwargs["env"]["GIT_CONFIG_GLOBAL"]
+                observed_values.append(real_run(
+                    ["git", "config", "--file", config_path, "--get-all", "safe.directory"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.splitlines())
+            return real_run(*args, **kwargs)
+
+        campaign = None
+        with (
+            mock.patch.object(controller, "_system_podman", return_value=str(executable)),
+            mock.patch.object(controller.subprocess, "run", side_effect=capture_clone_config),
+            mock.patch.dict(
+                os.environ,
+                {"FAKE_PODMAN_ROOT": str(volume_root), "FAKE_PODMAN_LOG": str(log)},
+            ),
+        ):
+            try:
+                campaign = self.create_campaign(
+                    workspace=str(linked),
+                    isolation_mode="podman",
+                    container_image="example.invalid/quality-loop@sha256:" + "b" * 64,
+                    container_network="none",
+                )
+            finally:
+                if campaign:
+                    controller._remove_podman_volume(campaign["podman_volume"])
+        self.assertEqual(observed_values, [[str(linked), str(linked_git_dir)]])
+        self.assertNotEqual(linked_git_dir, linked / ".git")
+
     def test_podman_campaign_runs_hard_gates_through_pinned_container(self):
         executable, volume_root, log = self.fake_podman()
         with (
