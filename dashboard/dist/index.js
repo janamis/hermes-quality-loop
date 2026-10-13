@@ -107,6 +107,7 @@
     if (state === "running") actions.push("pause");
     if (state === "paused" || state === "stopped" || state === "failed") actions.push("resume");
     if (state !== "succeeded" && state !== "stopped") actions.push("stop");
+    if (state === "succeeded" && campaign.publish_on_success && !(campaign.last_publish_result && campaign.last_publish_result.ok)) actions.push("publish");
     actions.push("reconcile");
 
     return h(Card, { className: "border-border/70" },
@@ -279,7 +280,7 @@
                 ],
                 help: "Simple writes short stage instructions for small local models; Complete keeps full guidance for cloud models."
               }),
-              h(Field, { name: "publish_on_success", label: "Commit and push after final PASS", value: form.publish_on_success, onChange: update, type: "checkbox", help: "Requires a ranking target and a dedicated Git worktree." }),
+              h(Field, { name: "publish_on_success", label: "Enable manual publish after final PASS", value: form.publish_on_success, onChange: update, type: "checkbox", help: "A succeeded campaign shows a separate Publish action; it never merges or deploys." }),
               h(Field, { name: "publish_remote", label: "Publish remote", value: form.publish_remote, onChange: update }),
               h(Field, { name: "publish_branch", label: "Publish branch", value: form.publish_branch, onChange: update, placeholder: "Current branch when blank" }),
               h(Field, { name: "commit_message", label: "Commit message", value: form.commit_message, onChange: update }),

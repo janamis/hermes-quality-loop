@@ -128,14 +128,15 @@ def campaign(campaign_id: str):
 
 @router.post("/campaigns/{campaign_id}/{action}")
 def act(campaign_id: str, action: str):
-    if action not in {"pause", "resume", "stop", "reconcile"}:
+    if action not in {"pause", "resume", "stop", "reconcile", "publish"}:
         raise HTTPException(status_code=404, detail="unknown action")
     try:
-        item = (
-            controller.reconcile_campaign(campaign_id)
-            if action == "reconcile"
-            else controller.set_campaign_state(campaign_id, action)
-        )
+        if action == "reconcile":
+            item = controller.reconcile_campaign(campaign_id)
+        elif action == "publish":
+            item = controller.publish_campaign(campaign_id)
+        else:
+            item = controller.set_campaign_state(campaign_id, action)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="campaign not found") from exc
     except ValueError as exc:

@@ -4,26 +4,26 @@ Quality Loop is a Hermes Agent plugin for durable code-quality campaigns on the 
 
 ## Workflow
 
-1. **Rank** the five quality categories without finding or scoping defects.
-2. **Select one category** from that ranking.
-3. **Find one defect** in the selected category. This card returns evidence as a non-empty JSON array
-   and does not choose files or implementation steps.
-4. **Scope** that one defect, then use a separate planning card to keep each executor atomic. A plan
-   may define 2–5 ordered slices when one safe change cannot fit in a single executor.
-5. **Execute one slice at a time** with the coding model. Only the current slice becomes ready.
-6. **Validate every slice independently** with the validation model. The next executor depends on the
-   preceding validator, so a later slice cannot start before the earlier slice passes.
-7. On focused validation failure, create a bounded repair for that same slice and revalidate it.
-8. After all slices pass, run one read-only **integrated validation** across the complete selected
-   improvement. An integration failure creates a scoped repair that preserves validated slices.
-9. Only after integrated validation passes, start a fresh ranking round.
-10. When defect finding returns `candidate_complete`, require a final whole-codebase validation.
-11. Finish only when the final validator passes **and** the configured build/test commands return exit code 0.
+1. When commands are omitted, run a read-only **discovery preflight** that can select only commands
+   derived by the controller from authenticated repository manifests.
+2. **Examine** the current code once: score the five quality categories, choose one category tied for
+   the lowest score, and return one evidence-backed atomic improvement touching at most two files.
+3. **Execute** only that improvement with the coding model. The controller injects the fixed build/test
+   commands, an exact file allowlist, and a repository snapshot into the card.
+4. **Validate** independently with the validation model, then run the controller-owned deterministic
+   build/test gates. The validator is read-only and never receives the gate command text.
+5. On validation failure, create a direct bounded repair for the same atomic improvement and revalidate
+   it, up to the configured repair limit.
+6. After a passing change, start a fresh examination round. When the examiner returns
+   `candidate_complete` (or the configured score target is reached), reuse the validation stage for a
+   final read-only whole-codebase audit.
+7. Finish only when the final validator passes **and** the configured build/test commands return exit
+   code 0. Publication remains a separate explicit action.
 
-The controller persists the selected category, improvement, and slice position so gateway restarts
-preserve ordering. Card idempotency includes parent lineage and slice scope, preventing a retry from
-reusing a stale task from a different slice. The split workflow uses card schema v3; older in-flight
-cards fail closed and require a fresh controller-owned ranking card instead of being reinterpreted.
+The controller persists every transition so gateway restarts preserve ordering. Card idempotency
+includes parent lineage and the authenticated improvement. The simplified workflow uses payload schema
+v2 and card schema v4; older in-flight stages fail closed and must be restarted instead of being
+reinterpreted.
 
 The controller registers `on_kanban_dispatch_tick` and never calls an LLM itself.
 
@@ -92,9 +92,9 @@ with the same permissions as Hermes. Only enter commands you trust.
 
 Use a dedicated branch or worktree. By default, Quality Loop does **not** commit, push, merge, or deploy changes.
 
-When **Publish after final PASS** is explicitly enabled, the controller constructs one
-commit from the authenticated campaign bytes and pushes that exact commit to the selected
-remote after the target score and final validation gates pass. In Podman mode it reads the
+When **Enable manual publish after final PASS** is selected, a succeeded campaign exposes a separate
+**Publish** action. Nothing is pushed automatically. The explicit action constructs one commit from
+the authenticated campaign bytes and pushes that exact commit to the selected remote. In Podman mode it reads the
 remote from the unchanged, re-authenticated source checkout; the isolated checkout has no
 remote and receives no host Git credentials. The source checkout is not modified or
 fast-forwarded. Before committing, the controller rejects common credential/key paths and
@@ -109,11 +109,11 @@ Quality Loop never merges or deploys changes.
 
 ## Worker completion contract
 
-Workers complete cards with `metadata.quality_loop.schema = "quality-loop/v1"`. Quality Loop checks
+Workers complete cards with `metadata.quality_loop.schema = "quality-loop/v2"`. Quality Loop checks
 for the controller-owned Kanban task capability before persisting a campaign, so an incompatible
 Hermes installation fails clearly without leaving a running campaign row. Missing or malformed stage metadata pauses the campaign as `needs_review` instead of guessing. The
-controller reports the first precise contract error, including whether defect evidence is not a
-non-empty array of unique strings.
+controller reports the first precise contract error, including malformed score, evidence, scope, or
+validation fields.
 
 ## Verification
 

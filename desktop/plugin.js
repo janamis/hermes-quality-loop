@@ -252,7 +252,7 @@ function CampaignCard({ campaign }) {
           campaign.target_average != null
             ? jsx('div', {
                 className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
-                children: `Ranking: ${campaign.last_average == null ? 'not scored' : `${campaign.last_average}/10`} · target ${campaign.target_average}/10${campaign.publish_on_success ? ' · publish on final PASS' : ''}`
+                children: `Ranking: ${campaign.last_average == null ? 'not scored' : `${campaign.last_average}/10`} · target ${campaign.target_average}/10${campaign.publish_on_success ? ' · publication enabled' : ''}`
               })
             : null,
           campaign.prompt_profile === 'simple'
@@ -272,6 +272,9 @@ function CampaignCard({ campaign }) {
                 : null,
               !['succeeded', 'stopped'].includes(campaign.state)
                 ? jsx(Button, { size: 'xs', variant: 'ghost', disabled: act.isPending, onClick: action('stop'), children: 'Stop' })
+                : null,
+              campaign.state === 'succeeded' && campaign.publish_on_success && !campaign.last_publish_result?.ok
+                ? jsx(Button, { size: 'xs', variant: 'outline', disabled: act.isPending, onClick: action('publish'), children: 'Publish' })
                 : null
             ]
           })
@@ -689,17 +692,17 @@ function CreateCampaign() {
           jsxs('section', {
             className: 'rounded-lg border border-(--ui-stroke-tertiary) p-4',
             children: [
-              jsx(SectionHeader, { step: '4', icon: 'repo-push', title: 'Publication', description: 'Keep results local by default, or explicitly publish only after the final PASS.' }),
+              jsx(SectionHeader, { step: '4', icon: 'repo-push', title: 'Publication', description: 'Keep results local by default, or enable a separate Publish action after the final PASS.' }),
               jsxs('div', {
                 className: 'mt-4 flex items-center justify-between gap-4 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/30 px-3 py-3',
                 children: [
                   jsxs('div', {
                     children: [
-                      jsx('div', { className: 'text-xs font-medium', children: 'Commit and push after final PASS' }),
-                      jsx('div', { className: 'mt-0.5 text-[0.625rem] text-(--ui-text-quaternary)', children: 'Never merges or deploys. Requires a ranking target and a safe Git worktree.' })
+                      jsx('div', { className: 'text-xs font-medium', children: 'Enable manual publish after final PASS' }),
+                      jsx('div', { className: 'mt-0.5 text-[0.625rem] text-(--ui-text-quaternary)', children: 'A succeeded campaign shows a separate Publish button. Never merges or deploys.' })
                     ]
                   }),
-                  jsx(Switch, { checked: publishOnSuccess, onCheckedChange: setPublishOnSuccess, 'aria-label': 'Publish after final pass' })
+                  jsx(Switch, { checked: publishOnSuccess, onCheckedChange: setPublishOnSuccess, 'aria-label': 'Enable publication after final pass' })
                 ]
               }),
               publishOnSuccess

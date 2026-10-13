@@ -42,6 +42,8 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertIn("SelectTrigger", source)
         self.assertIn("SelectItem", source)
         self.assertIn("onCheckedChange: setPublishOnSuccess", source)
+        self.assertIn("action('publish')", source)
+        self.assertIn("Enable manual publish after final PASS", source)
         self.assertIn("const [isolationMode, setIsolationMode] = useState('podman')", source)
         self.assertIn("isolation_mode: isolationMode", source)
         self.assertIn("container_image: isolationMode === 'podman' ? containerImage : null", source)
@@ -106,6 +108,46 @@ class PluginRegistrationTests(unittest.TestCase):
             api.CampaignCreate.model_fields["isolation_mode"].default, "workspace"
         )
         self.assertIsNone(api.CampaignCreate.model_fields["container_image"].default)
+
+    def test_dashboard_publish_action_is_explicit(self):
+        api_spec = importlib.util.spec_from_file_location(
+            "quality_loop_dashboard_api_publish_tested",
+            PLUGIN_ROOT / "dashboard" / "plugin_api.py",
+        )
+        assert api_spec and api_spec.loader
+        api = importlib.util.module_from_spec(api_spec)
+        api_spec.loader.exec_module(api)
+
+        published = {"id": "ql_test", "state": "succeeded"}
+        with mock.patch.object(
+            api.controller, "publish_campaign", return_value=published
+        ) as publish:
+            result = api.act("ql_test", "publish")
+
+        publish.assert_called_once_with("ql_test")
+        self.assertEqual(result, {"campaign": published})
+
+    def test_dashboard_publish_action_rejects_invalid_campaign_states(self):
+        api_spec = importlib.util.spec_from_file_location(
+            "quality_loop_dashboard_api_publish_errors_tested",
+            PLUGIN_ROOT / "dashboard" / "plugin_api.py",
+        )
+        assert api_spec and api_spec.loader
+        api = importlib.util.module_from_spec(api_spec)
+        api_spec.loader.exec_module(api)
+
+        cases = (
+            (KeyError("ql_missing"), 404, "campaign not found"),
+            (ValueError("only a succeeded campaign can be published"), 400, "only a succeeded"),
+            (ValueError("publication was not enabled for this campaign"), 400, "not enabled"),
+        )
+        for failure, status, detail in cases:
+            with self.subTest(failure=str(failure)):
+                with mock.patch.object(api.controller, "publish_campaign", side_effect=failure):
+                    with self.assertRaises(api.HTTPException) as caught:
+                        api.act("ql_test", "publish")
+                self.assertEqual(caught.exception.status_code, status)
+                self.assertIn(detail, str(caught.exception.detail))
 
     def test_dashboard_api_reads_cached_profile_model_catalog(self):
         api_spec = importlib.util.spec_from_file_location(

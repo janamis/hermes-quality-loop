@@ -1,9 +1,9 @@
 {
   "name": "quality-loop",
   "label": "Quality Loop",
-  "description": "Code examination, prompt execution, validation, repair, and repeat campaigns",
+  "description": "Code examination, atomic execution, independent validation, repair, and repeat campaigns",
   "icon": "Activity",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "tab": {
     "path": "/quality-loop",
     "position": "after:skills"
