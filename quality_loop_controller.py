@@ -1034,6 +1034,13 @@ byte-match the trusted contract. The controller, not this worker, persists the s
         )
         categories = "\n".join(f"- {name}" for name in RANKING_CATEGORIES)
         score_template = ",".join(f'"{name}":0.0' for name in RANKING_CATEGORIES)
+        typed_improvement = """score_rationale MUST be one non-empty JSON string, not an object.
+For proposal, selected_improvement must use exactly these keys: title, component, behavior, boundary,
+implementation_prompt, acceptance_criteria, relevant_files, excluded_scope, risks, evidence.
+title, component, behavior, boundary, and implementation_prompt are non-empty JSON strings;
+acceptance_criteria, relevant_files, excluded_scope, risks, and evidence are JSON arrays of non-empty strings.
+relevant_files contains 1-2 repository-relative file paths; evidence contains 1-5 items.
+Do not include verification_commands."""
         if simple:
             return header + f"""
 READ ONLY. Do not run commands. Score the current code, choose one category tied for the lowest
@@ -1041,10 +1048,9 @@ score, and select one concrete atomic improvement touching at most two files.
 {target_line}
 {categories}
 Payload fields: schema="{SCHEMA}", role=examine, score_breakdown={{{score_template}}},
-score_rationale, verdict="proposal", category, and selected_improvement. The improvement must contain
-exactly title, component, behavior, boundary, implementation_prompt, acceptance_criteria,
-relevant_files, excluded_scope, risks, and evidence. Omit verification commands. Use verdict
-"candidate_complete" and omit category/selected_improvement only when no important defect remains.
+verdict="proposal", category, and selected_improvement.
+{typed_improvement}
+Use verdict "candidate_complete" and omit category/selected_improvement only when no important defect remains.
 """
         return header + f"""
 READ-ONLY ASSESSMENT: inspect the current project without modifying files or running commands.
@@ -1053,12 +1059,12 @@ Score these categories, choose one category tied for the lowest score, and ident
 highest-impact defect in it:
 {categories}
 Return one atomic selected_improvement covering one component, observable behavior, and immediate
-boundary, with no more than two relevant files. Include narrow implementation instructions,
-acceptance criteria, excluded scope, risks, and 1–5 evidence strings. Omit verification commands;
-the controller injects its configured commands. Do not return multiple candidates or execution
-slices. Use verdict candidate_complete only when no important defect remains. Put schema, role,
-score_breakdown, score_rationale, verdict, category, and selected_improvement under
-metadata.quality_loop; omit category and selected_improvement for candidate_complete.
+boundary, with no more than two relevant files. Do not return multiple candidates or execution slices.
+{typed_improvement}
+The controller injects its configured commands. Use verdict candidate_complete only when no important
+defect remains. Put schema, role, score_breakdown, score_rationale, verdict, category, and
+selected_improvement under metadata.quality_loop; omit category and selected_improvement for
+candidate_complete.
 """
     if stage == "execute":
         if simple:

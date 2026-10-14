@@ -689,7 +689,31 @@ else:
         self.assertEqual(campaign["prompt_profile"], "complete")
         body = controller._task_body(campaign, "examine")
         self.assertIn("READ-ONLY ASSESSMENT", body)
-        self.assertIn("selected_improvement", body)
+        self.assertIn("one atomic selected_improvement", body)
+
+    def test_examine_prompts_define_the_exact_typed_payload_shape(self):
+        campaign = self.create_campaign()
+        for profile in ("complete", "simple"):
+            with self.subTest(profile=profile):
+                body = controller._task_body(dict(campaign, prompt_profile=profile), "examine")
+                normalized = " ".join(body.split())
+                self.assertIn(
+                    "score_rationale MUST be one non-empty JSON string, not an object",
+                    normalized,
+                )
+                self.assertIn("selected_improvement must use exactly these keys", normalized)
+                self.assertIn(
+                    "title, component, behavior, boundary, implementation_prompt",
+                    normalized,
+                )
+                self.assertIn(
+                    "acceptance_criteria, relevant_files, excluded_scope, risks, and evidence are JSON arrays",
+                    normalized,
+                )
+                self.assertIn(
+                    "relevant_files contains 1-2 repository-relative file paths; evidence contains 1-5 items",
+                    normalized,
+                )
 
     def test_campaign_cards_authenticate_the_profile_handoff_contract(self):
         expected = {
@@ -831,7 +855,7 @@ else:
             self.assertNotIn("metadata.quality_loop", body, stage)
             self.assertNotRegex(body, r"<[^>\n]+>", stage)
             # Local-model guidance stays bounded; final validation reuses the validator role.
-            limit = 1600 if stage in {"validate", "examine"} else 1300
+            limit = 2100 if stage == "examine" else 1600 if stage == "validate" else 1300
             self.assertLess(len(body), limit, f"{stage} prompt too long for local models")
             self.assertNotIn("Do only these four things", body, stage)
             self.assertNotIn("READ-ONLY EXAMINATION: inspect the CURRENT project", body, stage)
