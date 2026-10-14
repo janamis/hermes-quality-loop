@@ -690,6 +690,130 @@ else:
         self.assertIn("READ-ONLY RANKING", body)
         self.assertIn("Return only schema, role, score_breakdown", body)
 
+    def test_campaign_cards_authenticate_the_profile_handoff_contract(self):
+        expected = {
+            "complete": {
+                "kind": "metadata_or_summary_json_namespace",
+                "namespace": "quality_loop",
+                "prefix": "QUALITY_LOOP_JSON: ",
+            },
+            "simple": {
+                "kind": "summary_json_namespace",
+                "namespace": "quality_loop",
+                "prefix": "QUALITY_LOOP_JSON: ",
+            },
+        }
+        for profile, contract in expected.items():
+            with self.subTest(profile=profile):
+                campaign = self.create_campaign(
+                    prompt_profile=profile,
+                    board=f"handoff-{profile}",
+                )
+                conn = kbc.connect(board=campaign["board"])
+                try:
+                    provenance = [
+                        event
+                        for event in kb.list_events(conn, campaign["active_task_id"])
+                        if event.kind == "controller_provenance"
+                    ]
+                finally:
+                    conn.close()
+                self.assertEqual(len(provenance), 1)
+                self.assertEqual(provenance[0].payload["handoff_contract"], contract)
+
+    def test_controller_task_api_requires_keyword_handoff_contract_capability(self):
+        def legacy_create(conn, *, controller, title, body=""):
+            raise AssertionError("legacy API must not be invoked")
+
+        def positional_create(handoff_contract, /):
+            raise AssertionError("positional API must not be invoked")
+
+        def kwargs_create(conn, **kwargs):
+            raise AssertionError("unverified kwargs API must not be invoked")
+
+        for create in (legacy_create, positional_create, kwargs_create):
+            with self.subTest(create=create.__name__):
+                with mock.patch.object(
+                    controller.controller_tasks,
+                    "create_controller_task",
+                    create,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "handoff-contract"):
+                        controller._require_controller_task_api()
+
+    def test_created_card_must_persist_declared_handoff_contract(self):
+        def dropping_create(conn, *, controller: str, handoff_contract, **task_kwargs):
+            return kb.create_task(conn, created_by=controller, **task_kwargs)
+
+        with mock.patch.object(
+            controller.controller_tasks,
+            "create_controller_task",
+            dropping_create,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "persisted handoff contract"):
+                self.create_campaign()
+
+        conn = kbc.connect(board="quality")
+        try:
+            tasks = conn.execute("SELECT status FROM tasks").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([row["status"] for row in tasks], ["archived"])
+
+    def test_profile_handoff_contracts_enforce_the_documented_channels(self):
+        payload = {"schema": controller.SCHEMA, "role": "examine"}
+
+        simple = self.create_campaign(prompt_profile="simple", board="simple-channel")
+        conn = kbc.connect(board=simple["board"])
+        try:
+            with self.assertRaisesRegex(ValueError, "summary JSON"):
+                kb.complete_task(
+                    conn,
+                    simple["active_task_id"],
+                    summary="metadata only",
+                    metadata={"quality_loop": payload},
+                    fire_lifecycle_hook=False,
+                )
+            self.assertTrue(
+                kb.complete_task(
+                    conn,
+                    simple["active_task_id"],
+                    summary="QUALITY_LOOP_JSON: " + json.dumps({"quality_loop": payload}),
+                    fire_lifecycle_hook=False,
+                )
+            )
+        finally:
+            conn.close()
+
+        complete_metadata = self.create_campaign(board="complete-metadata")
+        conn = kbc.connect(board=complete_metadata["board"])
+        try:
+            self.assertTrue(
+                kb.complete_task(
+                    conn,
+                    complete_metadata["active_task_id"],
+                    summary="metadata channel",
+                    metadata={"quality_loop": payload},
+                    fire_lifecycle_hook=False,
+                )
+            )
+        finally:
+            conn.close()
+
+        complete_summary = self.create_campaign(board="complete-summary")
+        conn = kbc.connect(board=complete_summary["board"])
+        try:
+            self.assertTrue(
+                kb.complete_task(
+                    conn,
+                    complete_summary["active_task_id"],
+                    summary="QUALITY_LOOP_JSON: " + json.dumps({"quality_loop": payload}),
+                    fire_lifecycle_hook=False,
+                )
+            )
+        finally:
+            conn.close()
+
     def test_simple_prompt_profile_keeps_short_local_model_prompts(self):
         campaign = self.create_campaign(prompt_profile="simple")
         self.assertEqual(campaign["prompt_profile"], "simple")
@@ -1816,13 +1940,22 @@ else:
                 ],
                 "residual_risk": [],
             }
+        completion_summary = summary
+        completion_metadata = {"quality_loop": payload} if payload is not None else {}
+        if campaign.get("prompt_profile") == "simple" and payload is not None:
+            completion_summary = "QUALITY_LOOP_JSON: " + json.dumps(
+                {"quality_loop": payload},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            completion_metadata = {}
         conn = kbc.connect(board=campaign["board"])
         try:
             ok = kb.complete_task(
                 conn,
                 campaign["active_task_id"],
-                summary=summary,
-                metadata={"quality_loop": payload} if payload is not None else {},
+                summary=completion_summary,
+                metadata=completion_metadata,
                 fire_lifecycle_hook=False,
             )
             self.assertTrue(ok)
@@ -1917,6 +2050,28 @@ else:
                 result = self.complete(result, plan, auto_scope=False)
             return result
         return result
+
+    def assert_completion_blocked(self, campaign, *, summary):
+        conn = kbc.connect(board=campaign["board"])
+        try:
+            before = kb.get_task(conn, campaign["active_task_id"])
+            with self.assertRaisesRegex(
+                ValueError,
+                "requires either",
+            ):
+                kb.complete_task(
+                    conn,
+                    campaign["active_task_id"],
+                    summary=summary,
+                    metadata={},
+                    fire_lifecycle_hook=False,
+                )
+            after = kb.get_task(conn, campaign["active_task_id"])
+            assert before is not None and after is not None
+            self.assertEqual(after.status, before.status)
+        finally:
+            conn.close()
+        return controller.get_campaign(campaign["id"])
 
     def proposal(self, *, scores=None, commands=None, item=None):
         commands = commands or ["true"]
@@ -3832,11 +3987,11 @@ else:
         self.assertEqual(c["state"], "needs_review")
         self.assertIn("repair limit", c["message"].lower())
 
-    def test_malformed_examination_pauses_instead_of_looping(self):
+    def test_malformed_examination_is_rejected_before_finalization(self):
         c = self.create_campaign()
-        c = self.complete(c, None, summary="I think it looks good")
-        self.assertEqual(c["state"], "needs_review")
-        self.assertIn("missing namespaced", c["message"])
+        c = self.assert_completion_blocked(c, summary="I think it looks good")
+        self.assertEqual(c["state"], "running")
+        self.assertEqual(c["stage"], "examine")
 
     def test_actionable_examination_summary_without_metadata_fails_closed(self):
         c = self.create_campaign()
@@ -3845,8 +4000,8 @@ else:
             "force unwrap in RenderJobProjectSync.swift with safe optional binding, add focused "
             "regression tests for timeline-present and timeline-absent behavior, and run all gates."
         )
-        c = self.complete(c, None, summary=summary)
-        self.assertEqual(c["state"], "needs_review")
+        c = self.assert_completion_blocked(c, summary=summary)
+        self.assertEqual(c["state"], "running")
         self.assertEqual(c["stage"], "examine")
         self.assertIsNone(c["proposal_task_id"])
 
@@ -3857,8 +4012,8 @@ else:
             "Identified one high-priority bug: duplicate status badge rendering in the vehicle "
             "detail page. Recommend fixing the duplicate badge as the next implementation task."
         )
-        c = self.complete(c, None, summary=summary)
-        self.assertEqual(c["state"], "needs_review")
+        c = self.assert_completion_blocked(c, summary=summary)
+        self.assertEqual(c["state"], "running")
         self.assertEqual(c["stage"], "examine")
         self.assertIsNone(c["proposal_task_id"])
 
@@ -3870,8 +4025,8 @@ else:
             "Validation passed: swift build succeeds without warnings; all tests pass with "
             "0 failures; no critical/high issues and no regressions were found."
         )
-        c = self.complete(c, None, summary=summary)
-        self.assertEqual(c["state"], "needs_review")
+        c = self.assert_completion_blocked(c, summary=summary)
+        self.assertEqual(c["state"], "running")
         self.assertEqual(c["stage"], "validate")
         self.assertEqual(c["round_no"], 1)
 
@@ -3888,18 +4043,10 @@ else:
                 "Verdict: PASS. Build passes. Tests pass. Acceptance criteria met. "
                 "0 errors. 0 critical issues. 0 high issues. 0 regressions.",
             )
-            ok = kb.complete_task(
-                conn,
-                c["active_task_id"],
-                summary="Validation complete.",
-                metadata={},
-                fire_lifecycle_hook=False,
-            )
-            self.assertTrue(ok)
         finally:
             conn.close()
-        c = controller.reconcile_campaign(c["id"])
-        self.assertEqual(c["state"], "needs_review")
+        c = self.assert_completion_blocked(c, summary="Validation complete.")
+        self.assertEqual(c["state"], "running")
         self.assertEqual(c["stage"], "validate")
         self.assertEqual(c["round_no"], 1)
 
@@ -3912,8 +4059,8 @@ else:
             "Verdict: proposal. Single high-value improvement: add comprehensive test coverage "
             "for hooks, helpers, and critical UI components."
         )
-        c = self.complete(c, None, summary=summary)
-        self.assertEqual(c["state"], "needs_review")
+        c = self.assert_completion_blocked(c, summary=summary)
+        self.assertEqual(c["state"], "running")
         self.assertEqual(c["stage"], "examine")
         self.assertIsNone(c["last_average"])
 
@@ -3925,8 +4072,8 @@ else:
             "Validation PASS: Build succeeds, lint has only warnings (no errors), duplicate status "
             "badge removed from src/app/vehicle/[slug]/page.tsx. Acceptance criteria met."
         )
-        c = self.complete(c, None, summary=summary)
-        self.assertEqual(c["state"], "needs_review")
+        c = self.assert_completion_blocked(c, summary=summary)
+        self.assertEqual(c["state"], "running")
         self.assertEqual(c["stage"], "validate")
         self.assertEqual(c["round_no"], 1)
 
@@ -4369,7 +4516,7 @@ else:
                     "UPDATE tasks SET body = ? WHERE id = ?",
                     (str(task.body or "") + "\nforged contract\n", original_task_id),
                 )
-            self.assertTrue(
+            with self.assertRaisesRegex(ValueError, "provenance does not match"):
                 kb.complete_task(
                     conn,
                     original_task_id,
@@ -4377,15 +4524,46 @@ else:
                     metadata={"quality_loop": self.proposal()},
                     fire_lifecycle_hook=False,
                 )
-            )
+            current = kb.get_task(conn, original_task_id)
+            assert current is not None
+            self.assertEqual(current.status, "ready")
         finally:
             conn.close()
 
-        result = controller.reconcile_campaign(campaign["id"])
-        self.assertEqual(result["state"], "needs_review")
+        result = controller.get_campaign(campaign["id"])
+        self.assertEqual(result["state"], "running")
         self.assertEqual(result["stage"], "examine")
         self.assertEqual(result["active_task_id"], original_task_id)
-        self.assertIn("immutable controller creation provenance", result["message"])
+
+    def test_legacy_controller_provenance_survives_created_event_gc(self):
+        campaign = self.create_campaign()
+        task_id = campaign["active_task_id"]
+        conn = kbc.connect(board=campaign["board"])
+        try:
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            provenance = [
+                event
+                for event in kb.list_events(conn, task_id)
+                if event.kind == "controller_provenance"
+            ]
+            self.assertEqual(len(provenance), 1)
+            assert isinstance(provenance[0].payload, dict)
+            legacy_payload = dict(provenance[0].payload)
+            legacy_payload.pop("handoff_contract")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_events SET payload = ? WHERE id = ?",
+                    (json.dumps(legacy_payload, sort_keys=True), provenance[0].id),
+                )
+                conn.execute(
+                    "DELETE FROM task_events WHERE task_id = ? AND kind = 'created'",
+                    (task_id,),
+                )
+        finally:
+            conn.close()
+
+        self.assertIsNone(controller._trusted_card_error(campaign, task, "examine"))
 
     def test_validator_and_hard_gates_must_leave_workspace_read_only(self):
         campaign = self.create_campaign(test_command="printf gate-mutation >> app.py")
