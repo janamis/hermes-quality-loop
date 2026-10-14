@@ -29,8 +29,8 @@ The controller registers `on_kanban_dispatch_tick` and never calls an LLM itself
 
 ## Requirements
 
-- Hermes Agent 0.21.3 or newer
-- Hermes controller-owned Kanban task capability (`hermes_cli.kanban_db_controller`)
+- Hermes Agent with controller-owned Kanban task support
+- `hermes_cli.kanban_db_controller.create_controller_task(..., handoff_contract=...)`
 - Hermes Kanban enabled
 - Rootless Podman 5 or newer on local Linux for the recommended isolated mode; remote Podman
   connections and Podman-machine mount paths are intentionally unsupported

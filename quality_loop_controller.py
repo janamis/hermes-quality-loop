@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import inspect
 import json
 import hashlib
 import logging
@@ -52,6 +53,20 @@ def _require_controller_task_api() -> Callable[..., str]:
     if not callable(create):
         raise RuntimeError(
             "Quality Loop requires Hermes' controller-owned Kanban task API; "
+            "upgrade Hermes before creating or resuming a campaign"
+        )
+    handoff_parameter = inspect.signature(create).parameters.get("handoff_contract")
+    if handoff_parameter is None or handoff_parameter.kind not in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }:
+        raise RuntimeError(
+            "Quality Loop requires Hermes' controller-task handoff-contract API; "
+            "upgrade Hermes before creating or resuming a campaign"
+        )
+    if not callable(getattr(controller_tasks, "handoff_contract", None)):
+        raise RuntimeError(
+            "Quality Loop requires Hermes' persisted handoff-contract reader; "
             "upgrade Hermes before creating or resuming a campaign"
         )
     return cast(Callable[..., str], create)
@@ -2818,6 +2833,20 @@ def _selected_campaign_improvement(c: dict[str, Any]) -> Optional[dict[str, Any]
     return stored if isinstance(stored, dict) else None
 
 
+def _handoff_contract(c: dict[str, Any]) -> dict[str, str]:
+    if c.get("prompt_profile") == "simple":
+        return {
+            "kind": "summary_json_namespace",
+            "namespace": "quality_loop",
+            "prefix": "QUALITY_LOOP_JSON: ",
+        }
+    return {
+        "kind": "metadata_or_summary_json_namespace",
+        "namespace": "quality_loop",
+        "prefix": "QUALITY_LOOP_JSON: ",
+    }
+
+
 def _create_task(
     c: dict[str, Any],
     stage: str,
@@ -2867,9 +2896,16 @@ def _create_task(
     )
     conn = kbc.connect(board=c["board"])
     try:
-        return _require_controller_task_api()(
+        expected_contract = _handoff_contract(c)
+        create_controller_task = _require_controller_task_api()
+        read_handoff_contract = cast(
+            Callable[[sqlite3.Connection, str], Optional[dict[str, str]]],
+            getattr(controller_tasks, "handoff_contract"),
+        )
+        task_id = create_controller_task(
             conn,
             controller=PLUGIN_ID,
+            handoff_contract=expected_contract,
             title=f"[{c['name']}] {label} ({suffix})",
             body=(
                 _task_body(c, stage)
@@ -2898,6 +2934,18 @@ def _create_task(
             provider_override=c.get("provider_override"),
             board=c["board"],
         )
+        try:
+            persisted_contract = read_handoff_contract(conn, task_id)
+        except Exception as exc:
+            kb.archive_task(conn, task_id)
+            raise RuntimeError("created card's persisted handoff contract is unreadable") from exc
+        if persisted_contract != expected_contract:
+            if not kb.archive_task(conn, task_id):
+                raise RuntimeError(
+                    "created card's persisted handoff contract does not match and card archival failed"
+                )
+            raise RuntimeError("created card's persisted handoff contract does not match")
+        return task_id
     finally:
         conn.close()
 
@@ -3042,7 +3090,7 @@ def _trusted_card_error(c: dict[str, Any], task: Any, stage: str) -> Optional[st
         and isinstance(created[0].payload, dict)
         and created[0].payload.get("body_sha256") == expected_hash
     )
-    controller_match = (
+    legacy_controller_match = (
         len(provenance) == 1
         and provenance[0].payload == {
             "schema": "hermes/controller-task/v1",
@@ -3050,7 +3098,16 @@ def _trusted_card_error(c: dict[str, Any], task: Any, stage: str) -> Optional[st
             "body_sha256": expected_hash,
         }
     )
-    if not legacy_match and not controller_match:
+    controller_match = (
+        len(provenance) == 1
+        and provenance[0].payload == {
+            "schema": "hermes/controller-task/v1",
+            "controller": PLUGIN_ID,
+            "body_sha256": expected_hash,
+            "handoff_contract": _handoff_contract(c),
+        }
+    )
+    if not legacy_match and not legacy_controller_match and not controller_match:
         return "active card body does not match immutable controller creation provenance"
     lines = body.splitlines()
     expected_header = f"QUALITY LOOP CAMPAIGN: {c['id']}"
