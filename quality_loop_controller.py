@@ -1067,13 +1067,18 @@ selected_improvement under metadata.quality_loop; omit category and selected_imp
 candidate_complete.
 """
     if stage == "execute":
+        execute_shape = f"""The execute payload must use exactly these keys: schema, role, changed_files, verification, residual_risk.
+schema MUST equal "{SCHEMA}" and role MUST equal "execute".
+changed_files is a non-empty JSON array of repository-relative strings; residual_risk is a JSON array of strings and may be empty.
+verification is a non-empty JSON array of objects containing exactly command and exit_code; command is a non-empty string and exit_code MUST be integer 0."""
         if simple:
-            return header + """
+            return header + f"""
 Implement only SELECTED ITEM. Change only allowed files. Run the exact commands. Do not use git.
 If the change needs another file, call kanban_block.
-Payload fields: schema, role=execute, changed_files, verification (command and exit_code 0), residual_risk.
+Payload fields: schema, role=execute, changed_files, verification, residual_risk.
+{execute_shape}
 """
-        return header + """
+        return header + f"""
 Implement the specification or correction in the parent task result.
 Stay within scope, modify the code, add/update tests, and run relevant verification.
 Do not commit, stage, or otherwise change Git history or HEAD — the controller owns the
@@ -1083,6 +1088,7 @@ stop and call kanban_block with the exact dependency instead of broadening the t
 verification commands pass, immediately call kanban_complete; do not perform optional cleanup,
 additional refactoring, file-size analysis, or exploratory work. Put the `execute` payload under
 `metadata.quality_loop`.
+{execute_shape}
 """
     if stage != "validate":
         raise ValueError(f"unsupported quality-loop stage: {stage}")
@@ -1112,6 +1118,10 @@ FINAL STATIC ACCEPTANCE CRITERIA:
 - PASS only when static inspection finds no critical/high issue or regression.
 - Request controller-owned gates; do not execute them.
 """
+    validation_shape = f"""For PASS, the validate payload must use exactly these keys: schema, role, verdict, build_passed, tests_passed, critical_issues, high_issues, regressions, findings.
+schema MUST equal "{SCHEMA}" and role MUST equal "validate"; verdict is exactly "pass" or "fail".
+build_passed and tests_passed are JSON booleans; critical_issues, high_issues, and regressions are non-negative JSON integers.
+findings is a JSON array of strings and may be empty. For FAIL, add exactly one field: correction_prompt, as a non-empty JSON string."""
     if simple:
         return header + f"""
 {final_text}
@@ -1125,6 +1135,7 @@ PASS only if static inspection finds zero issues; else FAIL with correction_prom
 build_passed and tests_passed are gate requests, not evidence of commands run here.
 Payload fields: schema="{SCHEMA}", role=validate, verdict, build_passed, tests_passed, critical_issues,
 high_issues, regressions, findings; add correction_prompt only on FAIL.
+{validation_shape}
 """
     return header + f"""
 {final_text}
@@ -1146,6 +1157,7 @@ Set build_passed and tests_passed true only to request the controller-owned gate
 inspection predicts they should pass; they are not evidence of commands run here.
 Put the `validate` payload with schema="{SCHEMA}" under `metadata.quality_loop`. PASS is allowed only when static inspection
 finds every parent acceptance criterion met and critical/high/regression counts are zero.
+{validation_shape}
 """
 
 

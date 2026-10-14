@@ -715,6 +715,35 @@ else:
                     normalized,
                 )
 
+    def test_execute_and_validate_prompts_define_exact_typed_payload_shapes(self):
+        campaign = self.create_campaign()
+        for profile in ("complete", "simple"):
+            with self.subTest(profile=profile, stage="execute"):
+                body = controller._task_body(dict(campaign, prompt_profile=profile), "execute")
+                normalized = " ".join(body.split())
+                self.assertIn(
+                    "execute payload must use exactly these keys: schema, role, changed_files, verification, residual_risk",
+                    normalized,
+                )
+                self.assertIn(
+                    "verification is a non-empty JSON array of objects containing exactly command and exit_code",
+                    normalized,
+                )
+                self.assertIn("exit_code MUST be integer 0", normalized)
+            with self.subTest(profile=profile, stage="validate"):
+                body = controller._task_body(dict(campaign, prompt_profile=profile), "validate")
+                normalized = " ".join(body.split())
+                self.assertIn(
+                    "validate payload must use exactly these keys: schema, role, verdict, build_passed, tests_passed, critical_issues, high_issues, regressions, findings",
+                    normalized,
+                )
+                self.assertIn("build_passed and tests_passed are JSON booleans", normalized)
+                self.assertIn(
+                    "critical_issues, high_issues, and regressions are non-negative JSON integers",
+                    normalized,
+                )
+                self.assertIn("findings is a JSON array of strings", normalized)
+
     def test_campaign_cards_authenticate_the_profile_handoff_contract(self):
         expected = {
             "complete": {
@@ -855,7 +884,7 @@ else:
             self.assertNotIn("metadata.quality_loop", body, stage)
             self.assertNotRegex(body, r"<[^>\n]+>", stage)
             # Local-model guidance stays bounded; final validation reuses the validator role.
-            limit = 2100 if stage == "examine" else 1600 if stage == "validate" else 1300
+            limit = {"examine": 2100, "execute": 1800, "validate": 2200}.get(stage, 1300)
             self.assertLess(len(body), limit, f"{stage} prompt too long for local models")
             self.assertNotIn("Do only these four things", body, stage)
             self.assertNotIn("READ-ONLY EXAMINATION: inspect the CURRENT project", body, stage)
