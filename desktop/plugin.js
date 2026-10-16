@@ -69,40 +69,55 @@ const OFFLINE_MODEL_FALLBACKS = {
   ]
 }
 
+// Desktop plugins use the host stylesheet; responsive utility classes added
+// here are not compiled into that bundle. Keep this small layout self-owned.
+const CREATE_CAMPAIGN_LAYOUT_CSS = `
+  .ql-create-grid,
+  .ql-setup-grid { display: grid; }
+  @media (min-width: 1200px) {
+    .ql-create-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .ql-setup-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .ql-workspace { grid-column: span 2 / span 2; }
+    .ql-isolation { grid-column: span 1 / span 1; }
+    .ql-container { grid-column: span 3 / span 3; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .ql-container-image { grid-column: span 2 / span 2; }
+    .ql-profile { grid-column: 3; grid-row: 1; }
+  }
+`
+
 function Field({ label, hint, required = false, className = '', children }) {
   return jsxs('label', {
-    className: `flex min-w-0 flex-col gap-1.5 ${className}`,
+    className: `flex min-w-0 flex-col gap-1 ${className}`,
     children: [
       jsxs('span', {
-        className: 'flex items-center gap-1 text-[0.6875rem] font-medium text-(--ui-text-secondary)',
+        className: 'flex items-center gap-1 text-[0.6875rem] font-semibold text-(--ui-text-secondary)',
         children: [label, required ? jsx('span', { className: 'text-(--ui-accent)', children: '•' }) : null]
       }),
       children,
-      hint ? jsx('span', { className: 'text-[0.625rem] leading-4 text-(--ui-text-quaternary)', children: hint }) : null
+      hint ? jsx('span', { className: 'text-[0.625rem] leading-3.5 text-(--ui-text-tertiary)', children: hint }) : null
     ]
   })
 }
 
 function SectionHeader({ step, icon, title, description }) {
   return jsxs('div', {
-    className: 'flex items-start gap-3',
+    className: 'flex items-center gap-2.5',
     children: [
       jsx('div', {
-        className: 'grid size-8 shrink-0 place-items-center rounded-lg border border-(--ui-accent)/35 bg-(--ui-accent)/10 text-(--ui-accent)',
-        children: jsx(Codicon, { name: icon, size: '0.9rem' })
+        className: 'grid size-7 shrink-0 place-items-center rounded-md border border-(--ui-accent)/30 bg-(--ui-accent)/10 text-(--ui-accent)',
+        children: jsx(Codicon, { name: icon, size: '0.8rem' })
       }),
       jsxs('div', {
         className: 'min-w-0',
         children: [
           jsxs('div', {
-            className: 'flex items-center gap-2',
+            className: 'flex items-baseline gap-2',
             children: [
-              jsx('span', { className: 'text-[0.625rem] font-semibold uppercase tracking-[0.12em] text-(--ui-text-quaternary)', children: `Step ${step}` }),
-              jsx('span', { className: 'h-px w-5 bg-(--ui-stroke-tertiary)' })
+              jsx('h2', { className: 'text-[0.8125rem] font-semibold text-(--ui-text-primary)', children: title }),
+              jsx('span', { className: 'text-[0.5625rem] font-semibold uppercase tracking-[0.1em] text-(--ui-text-quaternary)', children: `Step ${step}` })
             ]
           }),
-          jsx('h2', { className: 'mt-0.5 text-sm font-semibold text-(--ui-text-primary)', children: title }),
-          jsx('p', { className: 'mt-0.5 text-[0.6875rem] leading-4 text-(--ui-text-tertiary)', children: description })
+          jsx('p', { className: 'mt-0.5 truncate text-[0.625rem] text-(--ui-text-tertiary)', title: description, children: description })
         ]
       })
     ]
@@ -133,20 +148,20 @@ function PickerWithContent({ value, onChange, placeholder, disabled = false, ite
 
 function RoleModel({ icon, title, description, value, onChange, models, loading }) {
   return jsxs('div', {
-    className: 'flex min-w-0 flex-col gap-3 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/35 p-3',
+    className: 'flex min-w-0 flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/25 p-2.5',
     children: [
       jsxs('div', {
-        className: 'flex items-start gap-2.5',
+        className: 'flex items-center gap-2',
         children: [
           jsx('div', {
-            className: 'grid size-7 shrink-0 place-items-center rounded-md bg-(--ui-accent)/10 text-(--ui-accent)',
-            children: jsx(Codicon, { name: icon, size: '0.8rem' })
+            className: 'grid size-6 shrink-0 place-items-center rounded bg-(--ui-accent)/10 text-(--ui-accent)',
+            children: jsx(Codicon, { name: icon, size: '0.72rem' })
           }),
           jsxs('div', {
             className: 'min-w-0',
             children: [
-              jsx('div', { className: 'text-xs font-semibold text-(--ui-text-primary)', children: title }),
-              jsx('p', { className: 'mt-0.5 text-[0.625rem] leading-4 text-(--ui-text-quaternary)', children: description })
+              jsx('div', { className: 'text-[0.6875rem] font-semibold text-(--ui-text-primary)', children: title }),
+              jsx('p', { className: 'text-[0.625rem] leading-4 text-(--ui-text-tertiary)', children: description })
             ]
           })
         ]
@@ -462,63 +477,58 @@ function CreateCampaign() {
   const canStart = !create.isPending && missing.length === 0
 
   return jsxs('section', {
-    className: 'rounded-xl border border-(--ui-stroke-secondary) bg-(--ui-bg-primary)',
+    className: 'overflow-hidden rounded-xl border border-(--ui-stroke-secondary) bg-(--ui-bg-primary)',
     children: [
+      jsx('style', { children: CREATE_CAMPAIGN_LAYOUT_CSS }),
       jsxs('div', {
-        className: 'relative overflow-hidden border-b border-(--ui-stroke-secondary) bg-(--ui-accent)/5 px-5 py-4',
+        className: 'border-b border-(--ui-stroke-secondary) bg-(--ui-accent)/5 px-4 py-3',
         children: [
-          jsx('div', { className: 'pointer-events-none absolute -right-10 -top-16 size-40 rounded-full border border-(--ui-accent)/15 bg-(--ui-accent)/5' }),
           jsxs('div', {
-            className: 'relative flex items-start justify-between gap-4',
+            className: 'flex flex-wrap items-center justify-between gap-3',
             children: [
               jsxs('div', {
-                className: 'flex items-start gap-3',
+                className: 'flex min-w-0 items-center gap-2.5',
                 children: [
                   jsx('div', {
-                    className: 'grid size-10 shrink-0 place-items-center rounded-xl border border-(--ui-accent)/30 bg-(--ui-accent)/10 text-(--ui-accent)',
-                    children: jsx(Codicon, { name: 'rocket', size: '1.05rem' })
+                    className: 'grid size-8 shrink-0 place-items-center rounded-lg border border-(--ui-accent)/30 bg-(--ui-accent)/10 text-(--ui-accent)',
+                    children: jsx(Codicon, { name: 'rocket', size: '0.9rem' })
                   }),
                   jsxs('div', {
+                    className: 'min-w-0',
                     children: [
-                      jsx('h2', { className: 'text-[0.9375rem] font-semibold', children: 'Launch a quality campaign' }),
-                      jsx('p', { className: 'mt-1 max-w-2xl text-[0.6875rem] leading-4 text-(--ui-text-tertiary)', children: 'Choose a Hermes profile, assemble a three-model review team, and set deterministic gates before any card is dispatched.' })
+                      jsx('h2', { className: 'text-sm font-semibold text-(--ui-text-primary)', children: 'Launch a quality campaign' }),
+                      jsx('p', { className: 'mt-0.5 truncate text-[0.6875rem] text-(--ui-text-tertiary)', children: 'Choose a workspace, review team, and deterministic quality gates.' })
                     ]
                   })
                 ]
               }),
-              jsx(Badge, { variant: 'secondary', children: 'Kanban-backed' })
-            ]
-          }),
-          jsxs('div', {
-            className: 'relative mt-4 flex flex-wrap items-center gap-1.5 text-[0.625rem] text-(--ui-text-tertiary)',
-            children: [
-              jsx(Badge, { variant: 'outline', children: '1 · Examine' }),
-              jsx(Codicon, { name: 'chevron-right', size: '0.6rem' }),
-              jsx(Badge, { variant: 'outline', children: '2 · Execute' }),
-              jsx(Codicon, { name: 'chevron-right', size: '0.6rem' }),
-              jsx(Badge, { variant: 'outline', children: '3 · Validate' }),
-              jsx(Codicon, { name: 'chevron-right', size: '0.6rem' }),
-              jsx(Badge, { variant: 'outline', children: '4 · Final audit' })
+              jsxs('div', {
+                className: 'flex items-center gap-2 text-[0.625rem]',
+                children: [
+                  jsx(Badge, { variant: 'outline', children: 'Examine → Execute → Validate → Audit' }),
+                  jsx(Badge, { variant: 'secondary', children: 'Kanban-backed' })
+                ]
+              })
             ]
           })
         ]
       }),
       jsxs('div', {
-        className: 'flex flex-col gap-4 p-4',
+        className: 'ql-create-grid items-start gap-3 p-3',
         children: [
           jsxs('section', {
-            className: 'rounded-lg border border-(--ui-stroke-tertiary) p-4',
+            className: 'rounded-lg border border-(--ui-stroke-tertiary) p-3',
             children: [
-              jsx(SectionHeader, { step: '1', icon: 'folder-opened', title: 'Campaign setup', description: 'Name the run and point it at an existing repository or dedicated worktree.' }),
+              jsx(SectionHeader, { step: '1', icon: 'folder-opened', title: 'Campaign setup', description: 'Choose the source repository; the campaign receives its own worktree.' }),
               jsxs('div', {
-                className: 'mt-4 grid gap-3 md:grid-cols-2',
+                className: 'ql-setup-grid mt-3 gap-3 md:grid-cols-2',
                 children: [
                   jsx(Field, { label: 'Campaign name', required: true, children: jsx(Input, { value: name, onChange: input(setName) }) }),
                   jsx(Field, { label: 'Kanban board', required: true, hint: 'Cards and run history will be stored on this board.', children: jsx(Input, { value: board, onChange: input(setBoard) }) }),
                   jsx(Field, {
                     label: 'Absolute workspace',
                     required: true,
-                    className: 'md:col-span-2',
+                    className: 'ql-workspace md:col-span-2',
                     hint: 'Use a clean project or worktree. Commands run with your Hermes permissions.',
                     children: jsxs('div', {
                       className: 'flex gap-2',
@@ -541,7 +551,7 @@ function CreateCampaign() {
                   }),
                   jsx(Field, {
                     label: 'Workspace isolation',
-                    className: 'md:col-span-2',
+                    className: 'ql-isolation md:col-span-2',
                     hint: 'Podman volume checkout keeps campaign files out of the source workspace and runs hard gates in disposable containers.',
                     children: jsx(PickerWithContent, {
                       value: isolationMode,
@@ -556,11 +566,12 @@ function CreateCampaign() {
                   }),
                   isolationMode === 'podman'
                     ? jsxs('div', {
-                        className: 'grid gap-3 md:col-span-2 md:grid-cols-2',
+                        className: 'ql-container grid gap-3 md:col-span-2 md:grid-cols-2',
                         children: [
                           jsx(Field, {
                             label: 'Pinned container image',
                             required: true,
+                            className: 'ql-container-image',
                             hint: 'The image must already exist in rootless Podman and include /bin/sh plus project build tools.',
                             children: jsx(Input, { value: containerImage, onChange: input(setContainerImage), placeholder: 'registry.example/image@sha256:…' })
                           }),
@@ -584,7 +595,7 @@ function CreateCampaign() {
                   jsx(Field, {
                     label: 'Hermes assignee profile',
                     required: true,
-                    className: 'md:col-span-2',
+                    className: 'ql-profile md:col-span-2',
                     hint: profilesQuery.isError ? 'Profile discovery failed; reload the plugin or check the gateway.' : 'The selected profile supplies credentials, tools, and the model catalog for every campaign card.',
                     children: profilesQuery.isLoading
                       ? jsx(Skeleton, { className: 'h-8 w-full' })
@@ -603,11 +614,11 @@ function CreateCampaign() {
             ]
           }),
           jsxs('section', {
-            className: 'rounded-lg border border-(--ui-stroke-tertiary) p-4',
+            className: 'rounded-lg border border-(--ui-stroke-tertiary) p-3',
             children: [
               jsx(SectionHeader, { step: '2', icon: 'organization', title: 'AI review team', description: 'One shared provider, with an independent model selected for each stage.' }),
               jsx('div', {
-                className: 'mt-4',
+                className: 'mt-3',
                 children: jsx(Field, {
                   label: 'Model provider',
                   hint: modelsQuery.isLoading
@@ -631,7 +642,7 @@ function CreateCampaign() {
                 })
               }),
               jsxs('div', {
-                className: 'mt-3 grid gap-3 lg:grid-cols-3',
+                className: 'mt-2.5 grid gap-2.5 lg:grid-cols-3',
                 children: [
                   jsx(RoleModel, { icon: 'search', title: 'Examiner', description: 'Audits the codebase and prioritizes one improvement.', value: examiner, onChange: setExaminer, models, loading: modelsQuery.isLoading }),
                   jsx(RoleModel, { icon: 'tools', title: 'Executor', description: 'Implements the selected change in the workspace.', value: executor, onChange: setExecutor, models, loading: modelsQuery.isLoading }),
@@ -653,11 +664,11 @@ function CreateCampaign() {
             ]
           }),
           jsxs('section', {
-            className: 'rounded-lg border border-(--ui-stroke-tertiary) p-4',
+            className: 'rounded-lg border border-(--ui-stroke-tertiary) p-3',
             children: [
               jsx(SectionHeader, { step: '3', icon: 'shield', title: 'Quality gates', description: 'Leave both commands empty to start with trusted project discovery.' }),
               jsxs('div', {
-                className: 'mt-4 grid gap-3 md:grid-cols-2',
+                className: 'mt-3 grid gap-3 md:grid-cols-2',
                 children: [
                   jsx(Field, { label: 'Build command', hint: 'Optional override; leave both gates empty for discovery.', children: jsx(Input, { value: buildCommand, onChange: input(setBuildCommand), placeholder: 'Auto-discover' }) }),
                   jsx(Field, { label: 'Test command', hint: 'Optional override; discovery selects only trusted candidates.', children: jsx(Input, { value: testCommand, onChange: input(setTestCommand), placeholder: 'Auto-discover' }) }),
@@ -671,7 +682,7 @@ function CreateCampaign() {
                   }),
                   jsx(Field, {
                     label: 'Prompt style',
-                    className: 'md:col-span-2',
+                    className: '',
                     hint: 'Simple writes short stage instructions for small local models; Complete keeps the full guidance for cloud models.',
                     children: jsx(PickerWithContent, {
                       value: promptProfile,
@@ -684,17 +695,17 @@ function CreateCampaign() {
                       ariaLabel: 'Prompt style'
                     })
                   }),
-                  jsx(Field, { label: 'Target score (0–10)', className: 'md:col-span-2', hint: 'Optional. When set, the loop continues until this average and a final PASS are reached.', children: jsx(Input, { type: 'number', min: 0.1, max: 10, value: targetAverage, onChange: input(setTargetAverage), placeholder: 'Optional; e.g. 9' }) })
+                  jsx(Field, { label: 'Target score (0–10)', hint: 'Optional. Continue until this average and a final PASS.', children: jsx(Input, { type: 'number', min: 0.1, max: 10, value: targetAverage, onChange: input(setTargetAverage), placeholder: 'Optional; e.g. 9' }) })
                 ]
               })
             ]
           }),
           jsxs('section', {
-            className: 'rounded-lg border border-(--ui-stroke-tertiary) p-4',
+            className: 'rounded-lg border border-(--ui-stroke-tertiary) p-3',
             children: [
               jsx(SectionHeader, { step: '4', icon: 'repo-push', title: 'Publication', description: 'Keep results local by default, or enable a separate Publish action after the final PASS.' }),
               jsxs('div', {
-                className: 'mt-4 flex items-center justify-between gap-4 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/30 px-3 py-3',
+                className: 'mt-3 flex items-center justify-between gap-3 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/25 px-3 py-2.5',
                 children: [
                   jsxs('div', {
                     children: [
@@ -720,7 +731,7 @@ function CreateCampaign() {
         ]
       }),
       jsxs('div', {
-        className: 'sticky bottom-0 flex flex-wrap items-center justify-between gap-3 border-t border-(--ui-stroke-secondary) bg-(--ui-bg-primary)/95 px-5 py-3 backdrop-blur',
+        className: 'sticky bottom-0 flex flex-wrap items-center justify-between gap-3 border-t border-(--ui-stroke-secondary) bg-(--ui-bg-primary)/95 px-4 py-2.5 backdrop-blur',
         children: [
           jsxs('div', {
             className: 'min-w-0',
