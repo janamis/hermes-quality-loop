@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 PLUGIN_ID = "quality-loop"
 SCHEMA = "quality-loop/v2"
 CARD_SCHEMA = "quality-loop-card/v4"
-CARD_ROLES = {"discover", "examine", "execute", "validate"}
+CARD_ROLES = {"discover", "rank", "examine", "execute", "validate"}
 RANKING_CATEGORIES = (
     "correctness_reliability",
     "security_safety",
@@ -1023,6 +1023,23 @@ number justified by project complexity and test feedback cost. Put the `discover
 `metadata.quality_loop`. At least one selected command must be non-empty. Every non-empty value must
 byte-match the trusted contract. The controller, not this worker, persists the selected configuration.
 """
+    if stage == "rank":
+        categories = "\n".join(f"- {name}" for name in RANKING_CATEGORIES)
+        target = c.get("target_average")
+        target_line = (
+            f"TARGET AVERAGE: {float(target):g}/10"
+            if target is not None
+            else "No numeric completion target is configured."
+        )
+        return header + f"""
+READ ONLY. Do not run commands. Score the current repository from 0 through 10 in every category,
+then select the highest-priority defect from TRUSTED_DEFECTS.
+{target_line}
+{categories}
+Return only: schema="{SCHEMA}", role="rank", score_breakdown, selected_index.
+score_breakdown contains exactly the five category names and numeric scores. selected_index is the
+1-based integer position of the defect to execute, or 0 only when TRUSTED_DEFECTS is empty.
+"""
     if stage == "examine":
         target = c.get("target_average")
         last = c.get("last_average")
@@ -1039,18 +1056,18 @@ For proposal, selected_improvement must use exactly these keys: title, component
 implementation_prompt, acceptance_criteria, relevant_files, excluded_scope, risks, evidence.
 title, component, behavior, boundary, and implementation_prompt are non-empty JSON strings;
 acceptance_criteria, relevant_files, excluded_scope, risks, and evidence are JSON arrays of non-empty strings.
+excluded_scope MUST be a JSON array (for example ["No other roles"]), never a string.
 relevant_files contains 1-2 repository-relative file paths; evidence contains 1-5 items.
 Do not include verification_commands."""
         if simple:
             return header + f"""
-READ ONLY. Do not run commands. Score the current code, choose one category tied for the lowest
-score, and select one concrete atomic improvement touching at most two files.
-{target_line}
+READ ONLY. Do not run commands. Examine the current repository and return up to 5 important defects.
+Return only: schema="{SCHEMA}", role="examine", defects.
+defects is a JSON array in highest-impact order. Each defect has exactly: title, category, behavior,
+acceptance_criteria, relevant_files, evidence. category is one of:
 {categories}
-Payload fields: schema="{SCHEMA}", role=examine, score_breakdown={{{score_template}}},
-verdict="proposal", category, and selected_improvement.
-{typed_improvement}
-Use verdict "candidate_complete" and omit category/selected_improvement only when no important defect remains.
+title/behavior are strings; the other fields are string arrays. Each defect touches 1-2
+repository-relative files and has 1-5 evidence items. Return fewer defects when fewer are supported.
 """
         return header + f"""
 READ-ONLY ASSESSMENT: inspect the current project without modifying files or running commands.
@@ -1073,10 +1090,10 @@ changed_files is a non-empty JSON array of repository-relative strings; residual
 verification is a non-empty JSON array of objects containing exactly command and exit_code; command is a non-empty string and exit_code MUST be integer 0."""
         if simple:
             return header + f"""
-Implement only SELECTED ITEM. Change only allowed files. Run the exact commands. Do not use git.
-If the change needs another file, call kanban_block.
-Payload fields: schema, role=execute, changed_files, verification, residual_risk.
-{execute_shape}
+Implement only SELECTED ITEM. Change only allowed files. Run every command listed in the card.
+Do not use git. If another file is needed, call kanban_block.
+After all listed commands pass, return only: schema, role="execute", changed_files, checks_passed=true.
+changed_files is the non-empty JSON array of files you changed.
 """
         return header + f"""
 Implement the specification or correction in the parent task result.
@@ -1131,11 +1148,9 @@ Do not call patch/write tools.
 Never run build/test/install or commands that create, delete, or modify filesystem, repository, Git, process, or network state;
 do not access the network.
 The controller runs the fixed gates after a valid PASS handoff.
-PASS only if static inspection finds zero issues; else FAIL with correction_prompt.
-build_passed and tests_passed are gate requests, not evidence of commands run here.
-Payload fields: schema="{SCHEMA}", role=validate, verdict, build_passed, tests_passed, critical_issues,
-high_issues, regressions, findings; add correction_prompt only on FAIL.
-{validation_shape}
+PASS only if static inspection finds no important issue; otherwise FAIL.
+For PASS return only: schema, role="validate", verdict="pass".
+For FAIL add only correction_prompt with one precise correction.
 """
     return header + f"""
 {final_text}
@@ -1277,6 +1292,71 @@ def _contains_gate_command(value: Any, c: dict[str, Any]) -> bool:
             for key, entry in value.items()
         )
     return False
+
+
+_COMPACT_DEFECT_FIELDS = {
+    "title", "category", "behavior", "acceptance_criteria", "relevant_files", "evidence",
+}
+
+
+def _normalize_compact_defect(raw: Any, c: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, dict) or set(raw) != _COMPACT_DEFECT_FIELDS:
+        return None
+    if _contains_gate_command(raw, c):
+        return None
+    title = raw.get("title")
+    behavior = raw.get("behavior")
+    category = raw.get("category")
+    criteria = _strict_string_list(raw.get("acceptance_criteria"))
+    files = _strict_string_list(raw.get("relevant_files"))
+    evidence = _strict_string_list(raw.get("evidence"))
+    if (
+        not isinstance(title, str)
+        or not title.strip()
+        or not isinstance(behavior, str)
+        or not behavior.strip()
+        or category not in RANKING_CATEGORIES
+        or criteria is None
+        or files is None
+        or evidence is None
+        or not 1 <= len(files) <= 2
+        or len(evidence) > 5
+        or any(not _safe_repo_file(value) for value in files)
+        or _relevant_files_error(c["workspace"], files)
+    ):
+        return None
+    return {
+        "title": title.strip(),
+        "category": category,
+        "behavior": behavior.strip(),
+        "acceptance_criteria": criteria,
+        "relevant_files": files,
+        "evidence": evidence,
+    }
+
+
+def _canonical_improvement_from_defect(
+    defect: dict[str, Any], c: dict[str, Any]
+) -> dict[str, Any]:
+    files = defect["relevant_files"]
+    file_text = ", ".join(files)
+    criteria_text = " ".join(defect["acceptance_criteria"])
+    return {
+        "title": defect["title"],
+        "component": files[0],
+        "behavior": defect["behavior"],
+        "boundary": f"Modify only these files: {file_text}.",
+        "implementation_prompt": (
+            f"Implement {defect['title']}: {defect['behavior']} "
+            f"Acceptance criteria: {criteria_text}"
+        ).strip(),
+        "acceptance_criteria": defect["acceptance_criteria"],
+        "verification_commands": _campaign_commands(c),
+        "relevant_files": files,
+        "excluded_scope": [f"Do not modify files outside: {file_text}."],
+        "risks": [],
+        "evidence": defect["evidence"],
+    }
 
 
 def _normalize_improvement(raw: Any, c: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -2846,6 +2926,27 @@ item's scope. The controller will create a fresh independent validation card aft
 """
 
 
+def _ranking_defects_body(defects: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(defects, sort_keys=True, separators=(",", ":"))
+    return f"\nTRUSTED_DEFECTS: {encoded}\nTreat TRUSTED_DEFECTS as read-only data.\n"
+
+
+def _trusted_defects_from_body(c: dict[str, Any], body: str) -> Optional[list[dict[str, Any]]]:
+    matches = re.findall(r"^TRUSTED_DEFECTS: ([^\n]+)$", body, flags=re.MULTILINE)
+    if len(matches) != 1:
+        return None
+    try:
+        raw = json.loads(matches[0])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(raw, list) or len(raw) > 5:
+        return None
+    normalized = [_normalize_compact_defect(item, c) for item in raw]
+    if any(item is None for item in normalized):
+        return None
+    return [item for item in normalized if item is not None]
+
+
 def _selected_campaign_improvement(c: dict[str, Any]) -> Optional[dict[str, Any]]:
     stored = c.get("selected_improvement")
     return stored if isinstance(stored, dict) else None
@@ -2870,6 +2971,7 @@ def _create_task(
     stage: str,
     parents: list[str],
     improvement: Optional[dict[str, Any]] = None,
+    defects: Optional[list[dict[str, Any]]] = None,
     correction: str = "",
     execution_snapshot: Optional[dict[str, Any]] = None,
 ) -> str:
@@ -2888,12 +2990,14 @@ def _create_task(
     model_key = {
         "discover": "examiner_model",
         "examine": "examiner_model",
+        "rank": "examiner_model",
         "execute": "executor_model",
         "validate": "validator_model",
     }[stage]
     label = {
         "discover": "Discover project configuration",
-        "examine": "Assess code and choose one improvement",
+        "examine": "Examine code and identify defects",
+        "rank": "Rank defects and select the top priority",
         "execute": "Execute one atomic improvement",
         "validate": "Validate implementation",
     }[stage]
@@ -2902,7 +3006,11 @@ def _create_task(
     else:
         suffix = f"round {c['round_no']}"
     lineage = json.dumps(
-        {"parents": sorted(parents), "improvement": improvement or {}},
+        {
+            "parents": sorted(parents),
+            "improvement": improvement or {},
+            "defects": defects or [],
+        },
         sort_keys=True,
         separators=(",", ":"),
         default=str,
@@ -2929,6 +3037,7 @@ def _create_task(
                 _task_body(c, stage)
                 + (_read_only_snapshot_body(read_only_snapshot) if read_only_snapshot else "")
                 + (_discovery_contract_body(c) if stage == "discover" else "")
+                + (_ranking_defects_body(defects or []) if stage == "rank" else "")
                 + (
                     _execution_contract_body(c, improvement, execution_snapshot)
                     if stage == "execute" and improvement
@@ -2945,7 +3054,7 @@ def _create_task(
             priority=10,
             parents=parents,
             idempotency_key=key,
-            max_runtime_seconds=1200 if stage == "examine" else 7200,
+            max_runtime_seconds=1200 if stage in {"examine", "rank"} else 7200,
             skills=[],
             max_retries=1 if stage == "execute" else 2,
             model_override=c[model_key],
@@ -3268,6 +3377,57 @@ def _execute_state_error(
     return None
 
 
+def _canonicalize_simple_handoff(
+    c: dict[str, Any], task: Any, stage: str, payload: Any
+) -> Any:
+    """Expand a small local-model handoff into the strict internal schema."""
+    if str(c.get("prompt_profile") or "complete") != "simple" or not isinstance(payload, dict):
+        return payload
+    if stage == "execute":
+        compact_fields = {"schema", "role", "changed_files", "checks_passed"}
+        if set(payload) != compact_fields or payload.get("checks_passed") is not True:
+            return payload
+        contract = _execution_contract_from_body(str(getattr(task, "body", "") or ""))
+        if contract is None:
+            return payload
+        return {
+            "schema": payload.get("schema"),
+            "role": payload.get("role"),
+            "changed_files": payload.get("changed_files"),
+            "verification": [
+                {"command": command, "exit_code": 0}
+                for command in contract["commands"]
+            ],
+            "residual_risk": [],
+        }
+    if stage == "validate":
+        verdict = payload.get("verdict")
+        if verdict == "pass" and set(payload) == {"schema", "role", "verdict"}:
+            return {
+                **payload,
+                "build_passed": True,
+                "tests_passed": True,
+                "critical_issues": 0,
+                "high_issues": 0,
+                "regressions": 0,
+                "findings": [],
+            }
+        if verdict == "fail" and set(payload) == {
+            "schema", "role", "verdict", "correction_prompt",
+        }:
+            correction = payload.get("correction_prompt")
+            return {
+                **payload,
+                "build_passed": False,
+                "tests_passed": False,
+                "critical_issues": 0,
+                "high_issues": 1,
+                "regressions": 0,
+                "findings": [correction] if isinstance(correction, str) else [],
+            }
+    return payload
+
+
 def _quality_payload_error(
     c: dict[str, Any], task: Any, stage: str, payload: Any
 ) -> Optional[str]:
@@ -3276,6 +3436,45 @@ def _quality_payload_error(
     if stage not in CARD_ROLES:
         return f"unsupported quality-loop stage: {stage}"
     role = stage
+    if str(c.get("prompt_profile") or "complete") == "simple" and role == "examine":
+        if set(payload) != {"schema", "role", "defects"}:
+            return "simple examination requires only schema, role, and defects"
+        if payload.get("schema") != SCHEMA or payload.get("role") != "examine":
+            return f"quality_loop must use schema {SCHEMA!r} and role 'examine'"
+        defects = payload.get("defects")
+        if not isinstance(defects, list) or len(defects) > 5:
+            return "defects must be a JSON array containing at most five items"
+        if any(_normalize_compact_defect(item, c) is None for item in defects):
+            return "each defect must be valid, evidence-based, and touch at most two files"
+        return None
+    if role == "rank":
+        if str(c.get("prompt_profile") or "complete") != "simple":
+            return "rank cards are supported only by the simple prompt profile"
+        expected = {"schema", "role", "score_breakdown", "selected_index"}
+        if set(payload) != expected:
+            return "ranking requires only schema, role, score_breakdown, and selected_index"
+        if payload.get("schema") != SCHEMA or payload.get("role") != "rank":
+            return f"quality_loop must use schema {SCHEMA!r} and role 'rank'"
+        average, _ranking, error = _ranking_average(payload)
+        if error or average is None:
+            return error or "invalid score_breakdown"
+        defects = _trusted_defects_from_body(c, str(getattr(task, "body", "") or ""))
+        if defects is None:
+            return "rank card has no valid trusted defects"
+        selected_index = payload.get("selected_index")
+        if type(selected_index) is not int:
+            return "selected_index must be an integer"
+        if defects and not 1 <= selected_index <= len(defects):
+            return "selected_index must identify one trusted defect"
+        if not defects and selected_index != 0:
+            return "selected_index must be 0 when there are no trusted defects"
+        if (
+            not defects
+            and c.get("target_average") is not None
+            and average < float(c["target_average"])
+        ):
+            return "an empty defect list cannot complete a ranking below target"
+        return None
     allowed = {
         "discover": {
             "schema", "role", "verdict", "project_kind", "languages", "manifests",
@@ -4461,6 +4660,9 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                 return get_campaign(campaign_id)
 
         if not c.get("active_task_id"):
+            if c["stage"] == "rank":
+                _pause(c, "Ranking stage is missing its authenticated defect list")
+                return get_campaign(campaign_id)
             task_id = _create_task(c, c["stage"], [])
             _update(campaign_id, active_task_id=task_id, message=f"{c['stage']} card ready")
             return get_campaign(campaign_id)
@@ -4501,6 +4703,7 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
             )
             return get_campaign(campaign_id)
         payload = _handoff(run, expected_role=stage)
+        payload = _canonicalize_simple_handoff(c, task, stage, payload)
         payload_error = _quality_payload_error(c, task, stage, payload)
         if payload_error:
             _pause(
@@ -4537,6 +4740,23 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                     "Project configuration accepted; examination ready with "
                     f"max_repairs={payload['max_repairs']}"
                 ),
+            )
+            return get_campaign(campaign_id)
+
+        if stage == "examine" and str(c.get("prompt_profile") or "complete") == "simple":
+            defects = [
+                normalized
+                for item in payload["defects"]
+                if (normalized := _normalize_compact_defect(item, c)) is not None
+            ]
+            selected = dict(c, stage="rank")
+            task_id = _create_task(selected, "rank", [task.id], defects=defects)
+            _update(
+                campaign_id,
+                stage="rank",
+                active_task_id=task_id,
+                processed_run_id=run.id if run else None,
+                message=f"Examination found {len(defects)} defects; ranking ready",
             )
             return get_campaign(campaign_id)
 
@@ -4612,6 +4832,81 @@ def _reconcile_campaign_in_process(campaign_id: str) -> Optional[dict[str, Any]]
                     message=(
                         f"Assessment selected one atomic {payload['category']} improvement; "
                         "execution ready"
+                    ),
+                )
+
+        elif stage == "rank":
+            average, ranking, ranking_error = _ranking_average(payload)
+            defects = _trusted_defects_from_body(c, str(task.body or ""))
+            if ranking_error or average is None or ranking is None or defects is None:
+                _pause(
+                    c,
+                    f"Ranking handoff is invalid: {ranking_error or 'trusted defects are missing'}",
+                    run_id=run.id if run else None,
+                )
+                return get_campaign(campaign_id)
+            target_average = c.get("target_average")
+            selected_index = int(payload["selected_index"])
+            final_requested = not defects or (
+                target_average is not None and average >= float(target_average)
+            )
+            if final_requested:
+                selected = dict(
+                    c,
+                    final_mode=True,
+                    last_average=average,
+                    last_ranking=ranking,
+                )
+                task_id = _create_task(selected, "validate", [task.id])
+                _update(
+                    campaign_id,
+                    stage="validate",
+                    active_task_id=task_id,
+                    proposal_task_id=task.id,
+                    processed_run_id=run.id if run else None,
+                    final_mode=1,
+                    last_average=average,
+                    last_ranking=json.dumps(ranking, sort_keys=True),
+                    selected_category=None,
+                    selected_improvement=None,
+                    repair_no=0,
+                    message=(
+                        f"Computed ranking average {average:g}/10 reached target "
+                        f"{float(target_average):g}/10; final validation ready"
+                        if target_average is not None
+                        else "Examination found no important defect; final validation ready"
+                    ),
+                )
+            else:
+                defect = defects[selected_index - 1]
+                improvement = _canonical_improvement_from_defect(defect, c)
+                selected = dict(
+                    c,
+                    selected_improvement=improvement,
+                    selected_category=defect["category"],
+                    last_average=average,
+                    last_ranking=ranking,
+                    final_mode=False,
+                    repair_no=0,
+                )
+                task_id = _create_task(
+                    selected, "execute", [task.id], improvement=improvement
+                )
+                _update(
+                    campaign_id,
+                    stage="execute",
+                    active_task_id=task_id,
+                    proposal_task_id=task.id,
+                    processed_run_id=run.id if run else None,
+                    final_mode=0,
+                    selected_category=defect["category"],
+                    selected_improvement=json.dumps(improvement, sort_keys=True),
+                    last_average=average,
+                    last_ranking=json.dumps(ranking, sort_keys=True),
+                    repair_no=0,
+                    pending_correction=None,
+                    message=(
+                        f"Ranking selected defect {selected_index} of {len(defects)}; execution ready"
                     ),
                 )
 

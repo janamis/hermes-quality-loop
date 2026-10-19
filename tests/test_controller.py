@@ -691,29 +691,27 @@ else:
         self.assertIn("READ-ONLY ASSESSMENT", body)
         self.assertIn("one atomic selected_improvement", body)
 
-    def test_examine_prompts_define_the_exact_typed_payload_shape(self):
+    def test_complete_examine_prompt_defines_the_exact_typed_payload_shape(self):
         campaign = self.create_campaign()
-        for profile in ("complete", "simple"):
-            with self.subTest(profile=profile):
-                body = controller._task_body(dict(campaign, prompt_profile=profile), "examine")
-                normalized = " ".join(body.split())
-                self.assertIn(
-                    "score_rationale MUST be one non-empty JSON string, not an object",
-                    normalized,
-                )
-                self.assertIn("selected_improvement must use exactly these keys", normalized)
-                self.assertIn(
-                    "title, component, behavior, boundary, implementation_prompt",
-                    normalized,
-                )
-                self.assertIn(
-                    "acceptance_criteria, relevant_files, excluded_scope, risks, and evidence are JSON arrays",
-                    normalized,
-                )
-                self.assertIn(
-                    "relevant_files contains 1-2 repository-relative file paths; evidence contains 1-5 items",
-                    normalized,
-                )
+        body = controller._task_body(campaign, "examine")
+        normalized = " ".join(body.split())
+        self.assertIn(
+            "score_rationale MUST be one non-empty JSON string, not an object",
+            normalized,
+        )
+        self.assertIn("selected_improvement must use exactly these keys", normalized)
+        self.assertIn(
+            "title, component, behavior, boundary, implementation_prompt",
+            normalized,
+        )
+        self.assertIn(
+            "acceptance_criteria, relevant_files, excluded_scope, risks, and evidence are JSON arrays",
+            normalized,
+        )
+        self.assertIn(
+            "relevant_files contains 1-2 repository-relative file paths; evidence contains 1-5 items",
+            normalized,
+        )
 
     def test_execute_and_validate_prompts_define_exact_typed_payload_shapes(self):
         campaign = self.create_campaign()
@@ -721,28 +719,36 @@ else:
             with self.subTest(profile=profile, stage="execute"):
                 body = controller._task_body(dict(campaign, prompt_profile=profile), "execute")
                 normalized = " ".join(body.split())
-                self.assertIn(
-                    "execute payload must use exactly these keys: schema, role, changed_files, verification, residual_risk",
-                    normalized,
-                )
-                self.assertIn(
-                    "verification is a non-empty JSON array of objects containing exactly command and exit_code",
-                    normalized,
-                )
-                self.assertIn("exit_code MUST be integer 0", normalized)
+                if profile == "complete":
+                    self.assertIn(
+                        "execute payload must use exactly these keys: schema, role, changed_files, verification, residual_risk",
+                        normalized,
+                    )
+                    self.assertIn(
+                        "verification is a non-empty JSON array of objects containing exactly command and exit_code",
+                        normalized,
+                    )
+                    self.assertIn("exit_code MUST be integer 0", normalized)
+                else:
+                    self.assertIn("changed_files, checks_passed=true", normalized)
+                    self.assertNotIn("residual_risk", normalized)
             with self.subTest(profile=profile, stage="validate"):
                 body = controller._task_body(dict(campaign, prompt_profile=profile), "validate")
                 normalized = " ".join(body.split())
-                self.assertIn(
-                    "validate payload must use exactly these keys: schema, role, verdict, build_passed, tests_passed, critical_issues, high_issues, regressions, findings",
-                    normalized,
-                )
-                self.assertIn("build_passed and tests_passed are JSON booleans", normalized)
-                self.assertIn(
-                    "critical_issues, high_issues, and regressions are non-negative JSON integers",
-                    normalized,
-                )
-                self.assertIn("findings is a JSON array of strings", normalized)
+                if profile == "complete":
+                    self.assertIn(
+                        "validate payload must use exactly these keys: schema, role, verdict, build_passed, tests_passed, critical_issues, high_issues, regressions, findings",
+                        normalized,
+                    )
+                    self.assertIn("build_passed and tests_passed are JSON booleans", normalized)
+                    self.assertIn(
+                        "critical_issues, high_issues, and regressions are non-negative JSON integers",
+                        normalized,
+                    )
+                    self.assertIn("findings is a JSON array of strings", normalized)
+                else:
+                    self.assertIn('role="validate", verdict="pass"', normalized)
+                    self.assertNotIn("build_passed", normalized)
 
     def test_campaign_cards_authenticate_the_profile_handoff_contract(self):
         expected = {
@@ -871,7 +877,7 @@ else:
     def test_simple_prompt_profile_keeps_short_local_model_prompts(self):
         campaign = self.create_campaign(prompt_profile="simple")
         self.assertEqual(campaign["prompt_profile"], "simple")
-        for stage in ("discover", "examine", "execute", "validate"):
+        for stage in ("discover", "examine", "rank", "execute", "validate"):
             body = controller._task_body(campaign, stage)
             # The machine-parsed trusted markers must survive the short profile.
             self.assertIn("TRUSTED_QUALITY_LOOP_CARD", body, stage)
@@ -888,8 +894,172 @@ else:
             self.assertLess(len(body), limit, f"{stage} prompt too long for local models")
             self.assertNotIn("Do only these four things", body, stage)
             self.assertNotIn("READ-ONLY EXAMINATION: inspect the CURRENT project", body, stage)
+        examine_body = controller._task_body(campaign, "examine")
+        self.assertIn("return up to 5 important defects", examine_body)
+        self.assertIn(
+            "title, category, behavior,\nacceptance_criteria, relevant_files, evidence",
+            examine_body,
+        )
+        self.assertNotIn("selected_improvement", examine_body)
+        self.assertNotIn("excluded_scope", examine_body)
+        self.assertNotIn("score_rationale", examine_body)
+        rank_body = controller._task_body(campaign, "rank")
+        self.assertIn("score_breakdown, selected_index", rank_body)
         execute_body = controller._task_body(campaign, "execute")
-        self.assertIn("Payload fields: schema, role=execute", execute_body)
+        self.assertIn('return only: schema, role="execute", changed_files, checks_passed=true', execute_body)
+        self.assertNotIn("verification", execute_body)
+        self.assertNotIn("residual_risk", execute_body)
+        validate_body = controller._task_body(campaign, "validate")
+        self.assertIn('For PASS return only: schema, role="validate", verdict="pass".', validate_body)
+        self.assertIn("For FAIL add only correction_prompt", validate_body)
+        self.assertNotIn("build_passed", validate_body)
+        self.assertNotIn("critical_issues", validate_body)
+
+    def test_simple_profile_examines_defects_then_ranks_and_executes_the_top_one(self):
+        campaign = self.create_campaign(prompt_profile="simple", target_average=9.0)
+        self.assertEqual(campaign["stage"], "examine")
+        self.assertEqual(campaign["active_task"]["model"], "example-examiner")
+        defects = [
+            {
+                "title": "Add a real application test",
+                "category": "test_quality",
+                "behavior": "The application behavior is covered by a deterministic test.",
+                "acceptance_criteria": ["The test fails before the fix and passes after it."],
+                "relevant_files": ["app.py", "tests/quadtree-slicing.test.js"],
+                "evidence": ["The current test does not exercise app.py."],
+            },
+            {
+                "title": "Reject an invalid application input",
+                "category": "correctness_reliability",
+                "behavior": "Invalid input is rejected deterministically.",
+                "acceptance_criteria": ["Invalid input returns the documented error."],
+                "relevant_files": ["app.py"],
+                "evidence": ["app.py currently accepts the invalid value."],
+            },
+        ]
+
+        campaign = self.complete(
+            campaign,
+            {"schema": controller.SCHEMA, "role": "examine", "defects": defects},
+        )
+
+        self.assertEqual(campaign["state"], "running")
+        self.assertEqual(campaign["stage"], "rank")
+        board = kbc.connect(board=campaign["board"])
+        try:
+            rank_task = kb.get_task(board, campaign["active_task_id"])
+        finally:
+            board.close()
+        assert rank_task is not None
+        rank_body = rank_task.body or ""
+        self.assertIn("TRUSTED_DEFECTS:", rank_body)
+        self.assertIn("selected_index", rank_body)
+        self.assertIn(defects[1]["title"], rank_body)
+
+        scores = {
+            name: (3.0 if name == "correctness_reliability" else 7.0)
+            for name in controller.RANKING_CATEGORIES
+        }
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "rank",
+                "score_breakdown": scores,
+                "selected_index": 2,
+            },
+        )
+
+        self.assertEqual(campaign["state"], "running")
+        self.assertEqual(campaign["stage"], "execute")
+        self.assertEqual(campaign["selected_category"], "correctness_reliability")
+        self.assertEqual(campaign["selected_improvement"]["title"], defects[1]["title"])
+        self.assertEqual(campaign["last_average"], 6.2)
+
+    def test_simple_profile_derives_execution_scope_from_ranked_defect(self):
+        campaign = self.create_campaign(prompt_profile="simple")
+        defect = {
+            "title": "Add a real application test",
+            "category": "test_quality",
+            "behavior": "The application behavior is covered by a deterministic test.",
+            "acceptance_criteria": ["The new test fails before the fix and passes after it."],
+            "relevant_files": ["app.py", "tests/quadtree-slicing.test.js"],
+            "evidence": ["The current test does not exercise app.py."],
+        }
+        campaign = self.complete(
+            campaign,
+            {"schema": controller.SCHEMA, "role": "examine", "defects": [defect]},
+        )
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "rank",
+                "score_breakdown": {
+                    name: (3.0 if name == "test_quality" else 7.0)
+                    for name in controller.RANKING_CATEGORIES
+                },
+                "selected_index": 1,
+            },
+        )
+
+        self.assertEqual(campaign["state"], "running")
+        self.assertEqual(campaign["stage"], "execute")
+        improvement = campaign["selected_improvement"]
+        self.assertEqual(improvement["component"], "app.py")
+        self.assertEqual(improvement["verification_commands"], ["true"])
+        self.assertEqual(improvement["risks"], [])
+        self.assertIn("app.py", improvement["boundary"])
+        self.assertIn(defect["behavior"], improvement["implementation_prompt"])
+
+    def test_simple_profile_accepts_compact_executor_handoff(self):
+        campaign = self.create_campaign(prompt_profile="simple")
+        proposal = self.proposal()
+        selected = proposal["selected_improvement"]
+        defect = {
+            "title": selected["title"],
+            "category": proposal["category"],
+            "behavior": selected["behavior"],
+            "acceptance_criteria": selected["acceptance_criteria"],
+            "relevant_files": selected["relevant_files"],
+            "evidence": selected["evidence"],
+        }
+        campaign = self.complete(
+            campaign,
+            {"schema": controller.SCHEMA, "role": "examine", "defects": [defect]},
+        )
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "rank",
+                "score_breakdown": proposal["score_breakdown"],
+                "selected_index": 1,
+            },
+        )
+        (self.workspace / "app.py").write_text("implemented\n", encoding="utf-8")
+
+        campaign = self.complete(
+            campaign,
+            {
+                "schema": controller.SCHEMA,
+                "role": "execute",
+                "changed_files": ["app.py"],
+                "checks_passed": True,
+            },
+        )
+
+        self.assertEqual(campaign["state"], "running")
+        self.assertEqual(campaign["stage"], "validate")
+
+        campaign = self.complete(
+            campaign,
+            {"schema": controller.SCHEMA, "role": "validate", "verdict": "pass"},
+        )
+
+        self.assertEqual(campaign["state"], "running")
+        self.assertEqual(campaign["stage"], "examine")
+        self.assertEqual(campaign["round_no"], 2)
 
     def test_every_validator_prompt_keeps_gates_controller_owned(self):
         for profile in ("simple", "complete"):
@@ -1140,19 +1310,20 @@ else:
             self.assertIn("candidate-complete claim", body, profile)
             self.assertNotIn("configured target is met", body, profile)
 
-    def test_simple_profile_combines_ranking_and_atomic_selection(self):
+    def test_simple_profile_separates_examination_from_ranking(self):
         campaign = self.create_campaign(prompt_profile="simple")
-        body = controller._task_body(campaign, "examine")
+        examine_body = controller._task_body(campaign, "examine")
+        rank_body = controller._task_body(campaign, "rank")
         for category in controller.RANKING_CATEGORIES:
-            self.assertIn(category, body)
-        self.assertNotIn("selected_defect", body)
-        normalized = " ".join(body.split())
-        self.assertIn('schema="quality-loop/v2", role=examine', normalized)
-        self.assertIn("select one concrete atomic improvement", normalized)
-        self.assertIn("touching at most two files", normalized)
+            self.assertIn(category, examine_body)
+            self.assertIn(category, rank_body)
+        self.assertIn('role="examine", defects', examine_body)
+        self.assertNotIn("score_breakdown", examine_body)
+        self.assertIn('role="rank", score_breakdown, selected_index', rank_body)
+        self.assertNotIn("acceptance_criteria", rank_body)
 
     def test_category_selection_rejects_a_category_above_the_lowest_score(self):
-        campaign = self.create_campaign(prompt_profile="simple")
+        campaign = self.create_campaign()
         scores = {
             "correctness_reliability": 8.5,
             "security_safety": 7.0,
@@ -1215,12 +1386,12 @@ else:
         self.assertNotIn("- build: `true`", body)
         self.assertNotIn("- test: `true`", body)
         self.assertNotIn("`true`", body)
-        self.assertIn('Payload fields: schema="quality-loop/v2", role=validate', body)
+        self.assertIn('role="validate", verdict="pass"', body)
         self.assertIn("READ-ONLY: inspect only inside WORKSPACE", body)
         self.assertIn("create, delete, or modify filesystem, repository, Git, process, or network state", body)
         self.assertIn("do not access the network", body)
         self.assertIn("The controller runs the fixed gates after a valid PASS handoff", body)
-        self.assertIn("not evidence of commands run here", body)
+        self.assertNotIn("build_passed", body)
         self.assertNotIn("and run the required build/tests", body)
         self.assertNotIn("Recovery fallback", body)
 
@@ -1229,19 +1400,17 @@ else:
             prompt_profile="simple", target_average=9.0,
             publish_on_success=True, publish_branch="rank-loop",
         )
-        body = controller._task_body(campaign, "examine")
+        body = controller._task_body(campaign, "rank")
         self.assertIn("TARGET AVERAGE: 9/10", body)
-        # A fresh campaign has no previous average; the line appears once round 2 begins.
-        self.assertNotIn("PREVIOUS COMPUTED AVERAGE", body)
         c = dict(campaign, last_average=7.5)
-        body = controller._task_body(c, "examine")
+        body = controller._task_body(c, "rank")
         self.assertIn("TARGET AVERAGE: 9/10", body)
-        self.assertIn("PREVIOUS COMPUTED AVERAGE: 7.5/10", body)
+        self.assertNotIn("PREVIOUS COMPUTED AVERAGE", body)
 
-    def test_examine_proposal_creates_one_executor_directly(self):
+    def test_complete_examine_proposal_creates_one_executor_directly(self):
         self.assertEqual(controller.SCHEMA, "quality-loop/v2")
         self.assertEqual(controller.CARD_SCHEMA, "quality-loop-card/v4")
-        campaign = self.create_campaign(prompt_profile="simple")
+        campaign = self.create_campaign()
         examiner_id = campaign["active_task_id"]
         scoped = self.scoped_item(
             "Return the tested value",
